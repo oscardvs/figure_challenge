@@ -1,0 +1,105 @@
+import asyncio
+from playwright.async_api import async_playwright, Page, Browser
+from typing import Any
+
+
+class BrowserController:
+    def __init__(self):
+        self.browser: Browser | None = None
+        self.page: Page | None = None
+        self.playwright = None
+
+    async def start(self, url: str, headless: bool = False) -> None:
+        """Launch browser and navigate to URL."""
+        self.playwright = await async_playwright().start()
+        self.browser = await self.playwright.chromium.launch(headless=headless)
+        self.page = await self.browser.new_page()
+        await self.page.set_viewport_size({"width": 1280, "height": 800})
+        await self.page.goto(url)
+
+    async def stop(self) -> None:
+        """Close browser."""
+        if self.browser:
+            await self.browser.close()
+        if self.playwright:
+            await self.playwright.stop()
+
+    async def screenshot(self) -> bytes:
+        """Take screenshot of current page."""
+        return await self.page.screenshot(type="png")
+
+    async def get_html(self) -> str:
+        """Get page HTML."""
+        return await self.page.content()
+
+    async def get_url(self) -> str:
+        """Get current URL."""
+        return self.page.url
+
+    async def click(self, selector: str) -> bool:
+        """Click element by selector. Returns success."""
+        try:
+            await self.page.click(selector, timeout=2000)
+            return True
+        except Exception:
+            return False
+
+    async def click_by_text(self, text: str) -> bool:
+        """Click element containing text."""
+        try:
+            await self.page.click(f"text={text}", timeout=2000)
+            return True
+        except Exception:
+            return False
+
+    async def type_text(self, selector: str, text: str) -> bool:
+        """Type text into input field."""
+        try:
+            await self.page.fill(selector, text)
+            return True
+        except Exception:
+            return False
+
+    async def scroll_to_bottom(self) -> None:
+        """Scroll to page bottom."""
+        await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+
+    async def close_popup_by_x(self) -> bool:
+        """Try to close popup by clicking X button."""
+        # Try various X button selectors
+        selectors = [
+            "button:has(img[alt*='close'])",
+            "[aria-label*='close']",
+            "[aria-label*='Close']",
+            ".close-button",
+            ".close",
+            "button:has-text('×')",
+            "button:has-text('X')",
+        ]
+        for sel in selectors:
+            try:
+                await self.page.click(sel, timeout=500)
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def wait_for_navigation(self, timeout: int = 5000) -> bool:
+        """Wait for navigation to complete."""
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=timeout)
+            return True
+        except Exception:
+            return False
+
+    async def execute_js(self, script: str) -> Any:
+        """Execute JavaScript on page."""
+        return await self.page.evaluate(script)
+
+    async def wait_for_selector(self, selector: str, timeout: int = 5000) -> bool:
+        """Wait for element to appear."""
+        try:
+            await self.page.wait_for_selector(selector, timeout=timeout)
+            return True
+        except Exception:
+            return False
