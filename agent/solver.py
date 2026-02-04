@@ -4,6 +4,14 @@ from browser import BrowserController
 from vision import VisionAnalyzer, ActionType
 from dom_parser import extract_hidden_codes
 from metrics import MetricsTracker
+from handlers import (
+    detect_challenge_type,
+    handle_cookie_consent,
+    handle_fake_popup,
+    handle_scroll_challenge,
+    handle_moving_element,
+    handle_delayed_content,
+)
 
 
 class ChallengeSolver:
@@ -79,6 +87,15 @@ class ChallengeSolver:
                 print(f"  Found codes in DOM: {dom_codes}")
                 filled = await self._try_fill_code(dom_codes)
                 if filled:
+                    await asyncio.sleep(0.2)
+                    continue
+
+            # Challenge type detection using handlers (no API call)
+            challenge_type = detect_challenge_type(html)
+            if challenge_type != "unknown":
+                print(f"  Detected challenge type: {challenge_type}")
+                handled = await self._handle_challenge_type(challenge_type)
+                if handled:
                     await asyncio.sleep(0.2)
                     continue
 
@@ -224,3 +241,23 @@ class ChallengeSolver:
             success = await self.browser.click_by_text("Next")
             if not success:
                 await self.browser.click_by_text("Continue")
+
+    async def _handle_challenge_type(self, challenge_type: str) -> bool:
+        """Handle detected challenge type using specialized handlers."""
+        if challenge_type == "cookie":
+            return await handle_cookie_consent(self.browser)
+
+        elif challenge_type == "fake_popup":
+            return await handle_fake_popup(self.browser)
+
+        elif challenge_type == "scroll":
+            return await handle_scroll_challenge(self.browser)
+
+        elif challenge_type == "delayed":
+            return await handle_delayed_content(self.browser)
+
+        elif challenge_type == "moving":
+            # Try to find and click moving element via JS
+            return await handle_moving_element(self.browser, "button, a")
+
+        return False
