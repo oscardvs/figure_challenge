@@ -79,8 +79,16 @@ class ChallengeSolver:
                 print(f"  Found codes in DOM: {dom_codes}")
                 filled = await self._try_fill_code(dom_codes)
                 if filled:
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.2)
                     continue
+
+            # Quick pattern detection (no API call)
+            quick_action = self._detect_quick_pattern(html)
+            if quick_action:
+                print(f"  Quick pattern: {quick_action}")
+                await self._execute_quick_action(quick_action)
+                await asyncio.sleep(0.2)
+                continue
 
             # Vision analysis only if needed
             print(f"  Attempt {attempt + 1}: Analyzing with vision...")
@@ -94,7 +102,7 @@ class ChallengeSolver:
             print(f"  Reasoning: {action.reasoning}")
 
             await self._execute_action(action)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
 
         return False
 
@@ -178,3 +186,41 @@ class ChallengeSolver:
         elif action.action_type == ActionType.EXTRACT_CODE:
             # Code extraction handled in main loop
             pass
+
+    def _detect_quick_pattern(self, html: str) -> str | None:
+        """Detect common challenge patterns without API call."""
+        html_lower = html.lower()
+
+        # Cookie consent
+        if "cookie" in html_lower and "consent" in html_lower:
+            return "cookie_consent"
+
+        # Scroll challenge
+        if "scroll down" in html_lower or "scroll to find" in html_lower:
+            return "scroll"
+
+        # Accept button visible
+        if ">accept<" in html_lower or ">accept all<" in html_lower:
+            return "accept"
+
+        # Continue/Next button (but not if there are many decoys)
+        if html_lower.count(">next<") == 1 or html_lower.count(">continue<") == 1:
+            return "next"
+
+        return None
+
+    async def _execute_quick_action(self, action: str) -> None:
+        """Execute quick pattern action."""
+        if action == "cookie_consent":
+            await self.browser.click_by_text("Accept")
+
+        elif action == "scroll":
+            await self.browser.scroll_to_bottom()
+
+        elif action == "accept":
+            await self.browser.click_by_text("Accept")
+
+        elif action == "next":
+            success = await self.browser.click_by_text("Next")
+            if not success:
+                await self.browser.click_by_text("Continue")
