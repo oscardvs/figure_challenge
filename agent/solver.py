@@ -22,6 +22,7 @@ class ChallengeSolver:
         self.metrics = MetricsTracker()
         self.max_attempts_per_challenge = 10
         self.current_challenge = 0
+        self.used_codes: set[str] = set()  # Track codes that already worked on previous steps
 
     async def run(self, start_url: str, headless: bool = False) -> dict:
         """Run through all 30 challenges."""
@@ -84,6 +85,8 @@ class ChallengeSolver:
         content_loaded = await self._wait_for_content()
         if not content_loaded:
             print(f"  WARNING: page content didn't load, continuing anyway", flush=True)
+
+        stale_recovery_done = False  # Only try React state reset once per step
 
         for attempt in range(20):  # More attempts, faster
             url = await self.browser.get_url()
@@ -425,6 +428,22 @@ class ChallengeSolver:
             dom_codes = extract_hidden_codes(html)
             if dom_codes:
                 print(f"  dom_codes: {dom_codes}", flush=True)
+
+                # Stale code recovery: if ALL codes were used on previous steps,
+                # the React SPA retained old component state. Reset via back/forward.
+                all_stale = all(c in self.used_codes for c in dom_codes)
+                if all_stale and not stale_recovery_done:
+                    print(f"  -> all {len(dom_codes)} codes stale, resetting React state...", flush=True)
+                    stale_recovery_done = True
+                    try:
+                        await self.browser.page.go_back(wait_until='domcontentloaded', timeout=2000)
+                        await asyncio.sleep(0.1)
+                        await self.browser.page.go_forward(wait_until='domcontentloaded', timeout=2000)
+                        await asyncio.sleep(0.3)
+                    except Exception:
+                        pass
+                    continue  # Retry with fresh React state
+
                 filled = await self._try_fill_code(dom_codes)
                 print(f"  filled: {filled}", flush=True)
             else:
@@ -1458,8 +1477,7 @@ class ChallengeSolver:
             """)
             await asyncio.sleep(0.3)
 
-            # Step 3: Click Solve button - try multiple approaches
-            # First focus number input and scroll it visible
+            # Step 3: Click Solve button - focus input first, then try multiple safe approaches
             await self.browser.page.evaluate("""
                 () => {
                     const input = document.querySelector('input[type="number"]') ||
@@ -1472,62 +1490,66 @@ class ChallengeSolver:
             """)
             await asyncio.sleep(0.1)
 
-            # Debug: log all button texts on the page
-            btn_debug = await self.browser.page.evaluate("""
+            # Primary: press Enter on the focused number input (safest, avoids trap buttons)
+            await self.browser.page.keyboard.press('Enter')
+            print(f"    -> pressed Enter on puzzle input", flush=True)
+            await asyncio.sleep(0.5)
+
+            # Check if puzzle was solved by Enter
+            puzzle_solved = await self.browser.page.evaluate("""
                 () => {
-                    const btns = [...document.querySelectorAll('button')];
-                    return btns.map(b => ({
-                        text: b.textContent.trim().substring(0, 30),
-                        disabled: b.disabled,
-                        visible: !!b.offsetParent
-                    })).filter(b => b.text.length > 0).slice(0, 10);
+                    const text = document.body.textContent || '';
+                    return text.includes('solved') || text.includes('Code revealed') ||
+                           text.includes('code revealed') || text.includes('Solved');
                 }
             """)
-            print(f"    -> buttons on page: {btn_debug}", flush=True)
 
-            # Try clicking Solve via JS - very broad matching
-            solved = await self.browser.page.evaluate("""
-                () => {
-                    const btns = [...document.querySelectorAll('button')];
-                    for (const btn of btns) {
-                        const t = (btn.textContent || '').trim().toLowerCase();
-                        if (t.includes('solve') && !btn.disabled) {
-                            btn.scrollIntoView({behavior: 'instant', block: 'center'});
-                            btn.click();
-                            return 'js_click: ' + t;
+            if not puzzle_solved:
+                # Try clicking ONLY buttons with text "Solve"/"Check"/"Verify" near the input
+                solved = await self.browser.page.evaluate("""
+                    () => {
+                        const input = document.querySelector('input[type="number"]') ||
+                                      document.querySelector('input[inputmode="numeric"]');
+                        if (!input) return false;
+                        // Search in input's parent containers (up to 3 levels)
+                        let container = input.parentElement;
+                        for (let i = 0; i < 3 && container; i++) {
+                            const btns = container.querySelectorAll('button');
+                            for (const btn of btns) {
+                                const t = (btn.textContent || '').trim().toLowerCase();
+                                if ((t.includes('solve') || t.includes('check') || t.includes('verify') || t === 'go') && !btn.disabled) {
+                                    btn.scrollIntoView({behavior: 'instant', block: 'center'});
+                                    btn.click();
+                                    return 'nearby_click: ' + t;
+                                }
+                            }
+                            container = container.parentElement;
                         }
-                    }
-                    // Second pass: pink/rose colored button
-                    for (const btn of btns) {
-                        const cls = btn.className || '';
-                        const t = (btn.textContent || '').trim().toLowerCase();
-                        if ((cls.includes('pink') || cls.includes('rose') || cls.includes('red')) &&
-                            !t.includes('submit') && !btn.disabled && t.length < 20) {
-                            btn.scrollIntoView({behavior: 'instant', block: 'center'});
-                            btn.click();
-                            return 'color_click: ' + t;
+                        // Global fallback: ONLY click buttons explicitly saying "Solve"
+                        const allBtns = [...document.querySelectorAll('button')];
+                        for (const btn of allBtns) {
+                            const t = (btn.textContent || '').trim().toLowerCase();
+                            if (t === 'solve' && !btn.disabled) {
+                                btn.scrollIntoView({behavior: 'instant', block: 'center'});
+                                btn.click();
+                                return 'global_solve: ' + t;
+                            }
                         }
+                        return false;
                     }
-                    return false;
-                }
-            """)
-            print(f"    -> solve result: {solved}", flush=True)
+                """)
+                if solved:
+                    print(f"    -> solve button: {solved}", flush=True)
 
-            if not solved:
-                # Press Enter on the focused number input
-                await self.browser.page.keyboard.press('Enter')
-                print(f"    -> pressed Enter on puzzle input", flush=True)
-
-            if not solved:
-                # Playwright fallback
-                for text in ['Solve', 'Check', 'Verify']:
-                    try:
-                        await self.browser.page.click(f"button:has-text('{text}')", timeout=1000)
-                        print(f"    -> Playwright clicked '{text}'", flush=True)
-                        solved = True
-                        break
-                    except Exception:
-                        continue
+                if not solved:
+                    # Playwright fallback - only exact matches
+                    for text in ['Solve', 'Check', 'Verify']:
+                        try:
+                            await self.browser.page.click(f"button:has-text('{text}')", timeout=1000)
+                            print(f"    -> Playwright clicked '{text}'", flush=True)
+                            break
+                        except Exception:
+                            continue
 
             await asyncio.sleep(1.0)
             return True
@@ -2190,8 +2212,20 @@ class ChallengeSolver:
         """Click buttons aggressively - no penalty for wrong clicks. Returns what was clicked."""
         return await self.browser.page.evaluate("""
             () => {
-                const result = {accept: 0, red: 0, gray: 0, submit: 0, reveal: 0};
+                const result = {accept: 0, red: 0, gray: 0, submit: 0, reveal: 0, skipped_traps: 0};
                 const clicked = new Set();
+
+                // Detect trap button pages: many navigation-style buttons = don't click them
+                const TRAP_WORDS = ['proceed', 'continue reading', 'next step', 'next page',
+                    'next section', 'move on', 'go forward', 'keep going', 'advance',
+                    'continue journey', 'click here', 'proceed forward'];
+                const allBtns = [...document.querySelectorAll('button')];
+                let trapCount = 0;
+                for (const btn of allBtns) {
+                    const t = (btn.textContent || '').trim().toLowerCase();
+                    if (TRAP_WORDS.some(w => t.includes(w))) trapCount++;
+                }
+                const hasTrapButtons = trapCount >= 3;
 
                 // Click Accept buttons first
                 document.querySelectorAll('button').forEach(btn => {
@@ -2213,13 +2247,14 @@ class ChallengeSolver:
                 });
 
                 // Click ALL X-like buttons (red, gray, any close button)
+                // BUT skip red/pink buttons on trap button pages
                 document.querySelectorAll('button').forEach(btn => {
                     if (btn.offsetParent && !clicked.has(btn)) {
                         const style = getComputedStyle(btn);
                         const bg = style.backgroundColor;
                         const text = btn.textContent.trim();
 
-                        // Check for X symbol
+                        // Check for X symbol (always safe to click)
                         if (text === '×' || text === 'X' || text === '✕') {
                             btn.click();
                             clicked.add(btn);
@@ -2227,7 +2262,24 @@ class ChallengeSolver:
                             return;
                         }
 
-                        // Check for red/pink background
+                        // On trap pages, skip ALL red/pink buttons (they're decoys)
+                        if (hasTrapButtons) {
+                            const match = bg.match(/rgb\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+                            if (match) {
+                                const [_, r, g, b] = match.map(Number);
+                                if (r > 180 && g < 100 && b < 100) {
+                                    result.skipped_traps++;
+                                    return;
+                                }
+                                // Also skip pink (high R, medium G/B)
+                                if (r > 200 && g > 80 && g < 160 && b > 80 && b < 170) {
+                                    result.skipped_traps++;
+                                    return;
+                                }
+                            }
+                        }
+
+                        // Check for red/pink background (only on non-trap pages)
                         const match = bg.match(/rgb\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
                         if (match) {
                             const [_, r, g, b] = match.map(Number);
@@ -2356,10 +2408,16 @@ class ChallengeSolver:
 
     async def _try_fill_code(self, codes: list[str]) -> bool:
         """Try to fill each code into input field. Returns True if any code was submitted."""
+        # Filter out codes that already worked on previous steps (stale SPA state)
+        fresh_codes = [c for c in codes if c not in self.used_codes]
+        if not fresh_codes and codes:
+            print(f"    -> all {len(codes)} codes are stale (used on previous steps), skipping", flush=True)
+            return False
+
         url_before = await self.browser.get_url()
         any_submitted = False
 
-        for code in codes:
+        for code in fresh_codes:
             try:
                 # Scroll the code input into view via JS first
                 await self.browser.page.evaluate("""
@@ -2399,22 +2457,60 @@ class ChallengeSolver:
                 # Wait for React to update
                 await asyncio.sleep(0.2)
 
-                # Click submit button via JS (to bypass any blocking popups)
+                # Click submit button via JS - find button NEAR the code input (avoid trap buttons)
                 clicked = await self.browser.page.evaluate("""
                     () => {
-                        let btn = document.querySelector('button[type="submit"]');
-                        if (!btn) {
-                            const btns = document.querySelectorAll('button');
-                            for (const b of btns) {
-                                if (b.textContent.includes('Submit') && !b.disabled) {
-                                    btn = b;
-                                    break;
+                        const TRAP_WORDS = ['proceed', 'continue', 'next step', 'next page',
+                            'next section', 'move on', 'go forward', 'keep going', 'advance',
+                            'continue reading', 'continue journey', 'click here', 'proceed forward'];
+                        const isTrap = (t) => TRAP_WORDS.some(w => t.toLowerCase().includes(w));
+
+                        const input = document.querySelector('input[placeholder*="code" i], input[placeholder*="Code"], input[type="text"]');
+                        if (!input) return false;
+
+                        // Strategy 1: Find submit/go button in same container as input (up to 3 levels)
+                        let container = input.parentElement;
+                        for (let i = 0; i < 3 && container; i++) {
+                            const btns = container.querySelectorAll('button');
+                            for (const btn of btns) {
+                                const t = (btn.textContent || '').trim();
+                                if (!btn.disabled && !isTrap(t) &&
+                                    (btn.type === 'submit' || t.includes('Submit') || t.includes('Go') || t === '→' || t === '>' || t.length <= 2)) {
+                                    btn.scrollIntoView({behavior: 'instant', block: 'center'});
+                                    btn.click();
+                                    return true;
                                 }
                             }
+                            // Also: if only 1 non-trap button in container, click it
+                            const nonTrapBtns = [...btns].filter(b => !b.disabled && !isTrap((b.textContent || '').trim()));
+                            if (nonTrapBtns.length === 1) {
+                                nonTrapBtns[0].scrollIntoView({behavior: 'instant', block: 'center'});
+                                nonTrapBtns[0].click();
+                                return true;
+                            }
+                            container = container.parentElement;
                         }
-                        if (btn && !btn.disabled) {
-                            btn.click();
-                            return true;
+
+                        // Strategy 2: Find button in same form as input
+                        const form = input.closest('form');
+                        if (form) {
+                            const btn = form.querySelector('button[type="submit"], button');
+                            if (btn && !btn.disabled) {
+                                btn.scrollIntoView({behavior: 'instant', block: 'center'});
+                                btn.click();
+                                return true;
+                            }
+                        }
+
+                        // Strategy 3: Global fallback - only exact "Submit" text (not trap words)
+                        const allBtns = document.querySelectorAll('button');
+                        for (const b of allBtns) {
+                            const t = (b.textContent || '').trim();
+                            if (t === 'Submit' && !b.disabled) {
+                                b.scrollIntoView({behavior: 'instant', block: 'center'});
+                                b.click();
+                                return true;
+                            }
                         }
                         return false;
                     }
@@ -2426,6 +2522,8 @@ class ChallengeSolver:
                     print(f"    -> pressed Enter", flush=True)
 
                 any_submitted = True
+                # Track submitted code so it's skipped on future steps (prevents stale SPA codes)
+                self.used_codes.add(code)
 
                 # Check if URL changed (code was correct)
                 await asyncio.sleep(0.5)
