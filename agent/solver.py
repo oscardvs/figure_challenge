@@ -354,6 +354,27 @@ class ChallengeSolver:
                                 print(f"  >>> PASSED <<<", flush=True)
                                 return True
 
+            # Handle Math/Puzzle Challenge (solve expression, type answer, click Solve)
+            if 'puzzle' in html_lower and ('solve' in html_lower or '= ?' in html_lower or '=?' in html_lower):
+                puzzle_result = await self._try_math_puzzle_challenge()
+                if puzzle_result:
+                    print(f"  math_puzzle: completed", flush=True)
+                    await asyncio.sleep(0.5)
+                    html = await self.browser.get_html()
+                    dom_codes = extract_hidden_codes(html)
+                    if dom_codes:
+                        print(f"  post-puzzle codes: {dom_codes}", flush=True)
+                        filled = await self._try_fill_code(dom_codes)
+                        if filled:
+                            url = await self.browser.get_url()
+                            if self._check_progress(url, challenge_num):
+                                self.metrics.end_challenge(
+                                    challenge_num, success=True,
+                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                )
+                                print(f"  >>> PASSED <<<", flush=True)
+                                return True
+
             # Handle Video Challenge (seek through frames to find code)
             if 'video' in html_lower and 'frame' in html_lower and 'seek' in html_lower:
                 video_result = await self._try_video_challenge()
@@ -1391,6 +1412,68 @@ class ChallengeSolver:
             return True
         except Exception as e:
             print(f"    -> sequence error: {e}", flush=True)
+            return False
+
+    async def _try_math_puzzle_challenge(self) -> bool:
+        """Handle Math/Puzzle Challenge - solve expression, type answer, click Solve."""
+        try:
+            result = await self.browser.page.evaluate("""
+                () => {
+                    const text = document.body.textContent || '';
+                    // Find math expression: "28 + 8 = ?" or "15 * 3 = ?"
+                    const mathMatch = text.match(/(\\d+)\\s*([+\\-*×÷\\/])\\s*(\\d+)\\s*=\\s*\\?/);
+                    if (!mathMatch) return {found: false, reason: 'no math expression'};
+
+                    const a = parseInt(mathMatch[1]);
+                    const op = mathMatch[2];
+                    const b = parseInt(mathMatch[3]);
+                    let answer;
+                    switch(op) {
+                        case '+': answer = a + b; break;
+                        case '-': answer = a - b; break;
+                        case '*': case '×': answer = a * b; break;
+                        case '/': case '÷': answer = Math.floor(a / b); break;
+                        default: answer = a + b;
+                    }
+
+                    // Find the number input and fill it
+                    const input = document.querySelector('input[type="number"]') ||
+                                  document.querySelector('input[inputmode="numeric"]') ||
+                                  document.querySelector('input');
+                    if (input) {
+                        // React-compatible value setting
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value').set;
+                        nativeInputValueSetter.call(input, String(answer));
+                        input.dispatchEvent(new Event('input', {bubbles: true}));
+                        input.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+
+                    // Click Solve button
+                    const btns = [...document.querySelectorAll('button')];
+                    let solved = false;
+                    for (const btn of btns) {
+                        const t = (btn.textContent || '').trim().toLowerCase();
+                        if ((t.includes('solve') || t.includes('check') || t.includes('verify') ||
+                             t.includes('answer')) && btn.offsetParent && !btn.disabled) {
+                            btn.click();
+                            solved = true;
+                            break;
+                        }
+                    }
+
+                    return {found: true, expression: `${a} ${op} ${b}`, answer, solved};
+                }
+            """)
+            print(f"    -> puzzle: {result}", flush=True)
+
+            if not result.get('found'):
+                return False
+
+            await asyncio.sleep(1.0)
+            return True
+        except Exception as e:
+            print(f"    -> math puzzle error: {e}", flush=True)
             return False
 
     async def _try_audio_challenge(self) -> bool:
