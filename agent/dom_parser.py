@@ -41,7 +41,21 @@ FALSE_POSITIVES = {
     'MULTIT', 'TABBED', 'REVEAL', 'HIDDEN', 'DECODE', 'BASE64',
     'PLAYED', 'ESCAPE', 'ALMOST', 'INSIDE', 'SEQUEN', 'PROGRE',
     'CLICKM', 'SCROLL', 'FILLER', 'SQUARE', 'CIRCLE', 'DRAWIN',
-    'GESTUR', 'SOLVED',
+    'GESTUR', 'SOLVED', 'ONNEXT', 'STEPGO', 'GOBACK', 'GONEXT',
+    'ONBACK', 'ONLOAD', 'ONOPEN', 'LETSCL', 'NTHISI',
+    'PROCEE', 'ENTER0', 'STARTS', 'FINISH', 'ENOUGH',
+    'VERSIO', 'NAVIGA', 'COMPLE', 'CHALLE', 'BROWSE',
+    'CORECT', 'PROCEE', 'CORREC', 'INCORR', 'SUBMIT',
+    'AWRONG', 'THISIS', 'WRONG0', 'DECOYC', 'FAKECO',
+    'NOTTHE', 'TRYTHI', 'PUZZLE', 'SOLVER', 'HEREGO',
+    'ONETHE', 'CWRONG', '1WRONG', '2WRONG', '3WRONG',
+    'ONMOVE', 'ONCLICK', 'ONLOAD', 'ONHOVE', 'ONFOCS', 'ONBLUR',
+    'ONMOUS', 'ONDRAG', 'ONDROP', 'ONSCRO', 'ONTOUC', 'ONPOIN',
+    'ONINPU', 'ONKEYP', 'ONKEYD', 'ONKEYU', 'ONSUBM', 'ONRESE',
+    'ONWHEE', 'ONCHAN', 'ONERRO', 'ONPLAY', 'ONPAUS', 'ONENDE',
+    'ABORTE', 'CLASST', 'CLASSI', 'CLASSN',
+    'WORKER', 'BROKEN', 'DETAIL', 'ATTEMP', 'ACCEPT',
+    'IFRAME', 'LEVELS', 'NESTED', 'DEEPER',
 }
 
 
@@ -97,6 +111,10 @@ def extract_hidden_codes(html: str) -> list[str]:
         if isinstance(title, str):
             codes.update(CODE_PATTERN.findall(title.upper()))
 
+    # Debug: count raw codes before filtering
+    raw_count = len(codes)
+    raw_codes_sample = sorted(codes)[:30]  # Save sample for debug
+
     # Filter out false positives
     codes = {c for c in codes if c not in FALSE_POSITIVES}
 
@@ -106,12 +124,51 @@ def extract_hidden_codes(html: str) -> list[str]:
     # Filter out pure numeric strings (not likely codes)
     codes = {c for c in codes if not c.isdigit()}
 
-    # Sort: codes with numbers first (more likely to be real codes like "TWA8Q7")
-    def has_number(s):
-        return any(c.isdigit() for c in s)
+    # Filter out SPECIFIC numbered-word false positive patterns
+    # Only filter "NN" + known false word suffix (like "10THIS", "25CLICK")
+    _false_suffixes = {'THIS', 'THAT', 'WHAT', 'STEP', 'ITEM', 'TASK', 'PAGE', 'FROM'}
+    codes = {c for c in codes if not (re.match(r'^\d{2}', c) and c[2:] in _false_suffixes)}
 
-    sorted_codes = sorted(codes, key=lambda c: (not has_number(c), c))
-    return sorted_codes
+    # Separate high-priority codes (from data attributes, comments) vs text codes
+    high_priority = set()
+    # Re-scan data-* and aria-* and comments specifically for high-priority codes
+    for elem in soup.find_all(True):
+        for key, value in elem.attrs.items():
+            if (key.startswith('data-') or key.startswith('aria-')) and isinstance(value, str):
+                for c in CODE_PATTERN.findall(value.upper()):
+                    if c in codes:
+                        high_priority.add(c)
+    for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
+        for c in CODE_PATTERN.findall(str(comment).upper()):
+            if c in codes:
+                high_priority.add(c)
+    for elem in soup.find_all(style=re.compile(r'display:\s*none|visibility:\s*hidden')):
+        for c in CODE_PATTERN.findall(elem.get_text().upper()):
+            if c in codes:
+                high_priority.add(c)
+    for elem in soup.find_all(attrs={'hidden': True}):
+        for c in CODE_PATTERN.findall(elem.get_text().upper()):
+            if c in codes:
+                high_priority.add(c)
+
+    # Sort: high-priority first, then codes with mixed letters+numbers, then others
+    def sort_key(c):
+        is_hp = c in high_priority
+        has_num = any(ch.isdigit() for ch in c)
+        has_alpha = any(ch.isalpha() for ch in c)
+        is_mixed = has_num and has_alpha
+        return (not is_hp, not is_mixed, c)
+
+    sorted_codes = sorted(codes, key=sort_key)
+    # Debug: print filtering stats
+    if raw_count > 0 and len(sorted_codes) == 0:
+        import sys
+        print(f"  [dom_parser] WARNING: {raw_count} raw codes all filtered out! Sample: {raw_codes_sample[:10]}", file=sys.stderr, flush=True)
+    elif len(sorted_codes) > 0:
+        import sys
+        print(f"  [dom_parser] {raw_count} raw -> {len(sorted_codes)} filtered", file=sys.stderr, flush=True)
+    # Limit to reasonable number to avoid wasting time on false positives
+    return sorted_codes[:15]
 
 
 def find_real_next_button(html: str) -> str | None:
