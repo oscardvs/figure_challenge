@@ -116,20 +116,17 @@ class ChallengeSolver:
             if special.get('handled'):
                 print(f"  special: {special}", flush=True)
 
-            # Use Playwright native clicks for radio/option selection (JS clicks don't trigger React)
-            if special.get('modal_scrolled') or special.get('modal_closed'):
-                radio_result = await self._try_radio_selection()
-                if radio_result:
-                    print(f"  radio_selected: True", flush=True)
-                    await asyncio.sleep(0.5)
-                    url = await self.browser.get_url()
-                    if self._check_progress(url, challenge_num):
-                        self.metrics.end_challenge(
-                            challenge_num, success=True,
-                            tokens_in=total_tokens_in, tokens_out=total_tokens_out
-                        )
-                        print(f"  >>> PASSED <<<", flush=True)
-                        return True
+            # Radio modals are handled in _handle_special_challenges (nativeSetter + hide)
+            # Check if the special handler's radio+submit caused navigation
+            if special.get('modal_closed'):
+                url = await self.browser.get_url()
+                if self._check_progress(url, challenge_num):
+                    self.metrics.end_challenge(
+                        challenge_num, success=True,
+                        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                    )
+                    print(f"  >>> PASSED <<<", flush=True)
+                    return True
 
             # If a countdown timer was detected, wait for it to finish (only first 3 attempts)
             if special.get('has_timer') and special.get('timer_seconds', 0) > 0 and attempt < 3:
@@ -159,7 +156,7 @@ class ChallengeSolver:
                 kbd_result = await self._try_keyboard_sequence(html_check)
                 if kbd_result:
                     print(f"  keyboard_sequence: completed", flush=True)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                     # Re-extract codes after sequence completes
                     html = await self.browser.get_html()
                     dom_codes = extract_hidden_codes(html)
@@ -182,7 +179,7 @@ class ChallengeSolver:
                 dnd_result = await self._try_drag_and_drop()
                 if dnd_result:
                     print(f"  drag_and_drop: completed", flush=True)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                     # Re-extract codes after filling slots
                     html = await self.browser.get_html()
                     dom_codes = extract_hidden_codes(html)
@@ -204,7 +201,7 @@ class ChallengeSolver:
                 hover_result = await self._try_hover_challenge()
                 if hover_result:
                     print(f"  hover_challenge: completed", flush=True)
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.1)
                     html = await self.browser.get_html()
                     dom_codes = extract_hidden_codes(html)
                     if dom_codes:
@@ -225,7 +222,7 @@ class ChallengeSolver:
                 canvas_result = await self._try_canvas_challenge()
                 if canvas_result:
                     print(f"  canvas_challenge: completed", flush=True)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                     html = await self.browser.get_html()
                     dom_codes = extract_hidden_codes(html)
                     if dom_codes:
@@ -246,7 +243,7 @@ class ChallengeSolver:
                 timing_result = await self._try_timing_challenge()
                 if timing_result:
                     print(f"  timing_challenge: completed", flush=True)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                     html = await self.browser.get_html()
                     dom_codes = extract_hidden_codes(html)
                     if dom_codes:
@@ -267,7 +264,7 @@ class ChallengeSolver:
                 audio_result = await self._try_audio_challenge()
                 if audio_result:
                     print(f"  audio_challenge: completed", flush=True)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                     html = await self.browser.get_html()
                     dom_codes = extract_hidden_codes(html)
                     if dom_codes:
@@ -288,7 +285,7 @@ class ChallengeSolver:
                 split_result = await self._try_split_parts_challenge()
                 if split_result:
                     print(f"  split_parts: completed", flush=True)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                     html = await self.browser.get_html()
                     dom_codes = extract_hidden_codes(html)
                     if dom_codes:
@@ -309,7 +306,7 @@ class ChallengeSolver:
                 rotate_result = await self._try_rotating_code_challenge()
                 if rotate_result:
                     print(f"  rotating_code: completed", flush=True)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                     html = await self.browser.get_html()
                     dom_codes = extract_hidden_codes(html)
                     if dom_codes:
@@ -330,7 +327,7 @@ class ChallengeSolver:
                 tab_result = await self._try_multi_tab_challenge()
                 if tab_result:
                     print(f"  multi_tab: completed", flush=True)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                     html = await self.browser.get_html()
                     dom_codes = extract_hidden_codes(html)
                     if dom_codes:
@@ -351,7 +348,7 @@ class ChallengeSolver:
                 seq_result = await self._try_sequence_challenge()
                 if seq_result:
                     print(f"  sequence_challenge: completed", flush=True)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                     html = await self.browser.get_html()
                     dom_codes = extract_hidden_codes(html)
                     if dom_codes:
@@ -372,7 +369,7 @@ class ChallengeSolver:
                 puzzle_result = await self._try_math_puzzle_challenge()
                 if puzzle_result:
                     print(f"  math_puzzle: completed", flush=True)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                     html = await self.browser.get_html()
                     dom_codes = extract_hidden_codes(html)
                     if dom_codes:
@@ -393,7 +390,7 @@ class ChallengeSolver:
                 video_result = await self._try_video_challenge()
                 if video_result:
                     print(f"  video_challenge: completed", flush=True)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                     html = await self.browser.get_html()
                     dom_codes = extract_hidden_codes(html)
                     if dom_codes:
@@ -628,6 +625,38 @@ class ChallengeSolver:
                     }
                 });
 
+                // 2a2. HIDE radio modal overlays - they're decoys, real code comes from hover/main challenge
+                // Try React-compatible nativeSetter before hiding, in case one option does work
+                document.querySelectorAll('.fixed').forEach(el => {
+                    const radios = el.querySelectorAll('input[type="radio"]');
+                    const hasSubmit = [...el.querySelectorAll('button')].some(b => b.textContent.includes('Submit'));
+                    if (radios.length > 0 && hasSubmit) {
+                        // Try nativeSetter on "correct" option for React compatibility
+                        for (const radio of radios) {
+                            const label = (radio.closest('[class*="border"]') || radio.closest('div'))?.textContent || '';
+                            const t = label.toLowerCase();
+                            if (t.includes('correct') && t.includes('option')) {
+                                try {
+                                    const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked').set;
+                                    s.call(radio, true);
+                                    radio.dispatchEvent(new Event('change', {bubbles: true}));
+                                    radio.dispatchEvent(new Event('input', {bubbles: true}));
+                                } catch(e) {}
+                                break;
+                            }
+                        }
+                        // Click Submit one final time
+                        el.querySelectorAll('button').forEach(btn => {
+                            if (btn.textContent.includes('Submit')) btn.click();
+                        });
+                        // Hide modal to unblock hover/main challenge underneath
+                        hideElement(el);
+                        result.modal_closed = true;
+                        result.popups_removed++;
+                        result.handled = true;
+                    }
+                });
+
                 // 2b. Handle "Modal Dialog" popups with REAL close buttons
                 // These say "Click the button to dismiss" - the Close button actually works
                 document.querySelectorAll('.fixed').forEach(el => {
@@ -692,8 +721,7 @@ class ChallengeSolver:
                     if (el.classList.contains('bg-black/70') ||
                         el.style.backgroundColor?.includes('rgba(0, 0, 0')) {
                         if (!el.textContent.includes('Cookie') &&
-                            !el.textContent.includes('Step') &&
-                            !el.querySelector('input[type="radio"]')) {
+                            !el.textContent.includes('Step')) {
                             el.style.pointerEvents = 'none';
                             result.handled = true;
                         }
@@ -795,93 +823,98 @@ class ChallengeSolver:
                     });
                 }
             """)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.1)
 
-            # Step 2: Find hover target, prefer innermost child, dispatch React events
+            # Step 2: Find ALL hover candidates, dispatch events on each, mark best
             target_info = await self.browser.page.evaluate("""
                 () => {
                     // Remove old markers
                     document.querySelectorAll('[data-hover-target]').forEach(el => el.removeAttribute('data-hover-target'));
 
-                    let best = null;
+                    // Collect ALL hover candidates from multiple strategies
+                    const candidates = [];
+                    const isInPopup = (el) => {
+                        const f = el.closest('.fixed');
+                        return f && !f.querySelector('input[type="text"]'); // popups don't have code inputs
+                    };
 
-                    // Strategy 1: cursor-pointer elements - find innermost interactive child
+                    // Strategy 1: cursor-pointer elements + their inner children (skip popup elements)
                     const cursorEls = [...document.querySelectorAll('[class*="cursor-pointer"]')].filter(el => {
-                        return el.offsetParent && el.offsetWidth > 50 && el.offsetHeight > 30;
+                        return el.offsetParent && el.offsetWidth > 50 && el.offsetHeight > 30 && !isInPopup(el);
                     });
                     for (const parent of cursorEls) {
-                        // Prefer inner child with bg/border/padding classes (React event target)
                         const children = parent.querySelectorAll('div');
+                        let addedChild = false;
                         for (const child of children) {
                             const cls = child.className || '';
                             if (child.offsetWidth > 30 && child.offsetHeight > 20 &&
                                 child.offsetParent &&
                                 (cls.includes('bg-') || cls.includes('border') || cls.includes('p-'))) {
-                                best = child;
+                                candidates.push(child);
+                                addedChild = true;
                                 break;
                             }
                         }
-                        if (!best) best = parent;
-                        break;
+                        if (!addedChild) candidates.push(parent);
                     }
 
-                    // Strategy 2: bordered box element (fallback)
-                    if (!best) {
-                        const borderEls = [...document.querySelectorAll('div')].filter(el => {
-                            const cls = el.className || '';
-                            return cls.includes('border-2') && cls.includes('rounded') &&
-                                   el.offsetParent && el.offsetWidth > 50;
-                        });
-                        if (borderEls.length > 0) best = borderEls[0];
+                    // Strategy 2: bordered box elements
+                    [...document.querySelectorAll('div')].forEach(el => {
+                        const cls = el.className || '';
+                        if (cls.includes('border-2') && cls.includes('rounded') &&
+                               el.offsetParent && el.offsetWidth > 50) {
+                            candidates.push(el);
+                        }
+                    });
+
+                    // Strategy 3: min-h elements with border
+                    [...document.querySelectorAll('div')].forEach(el => {
+                        const cls = el.className || '';
+                        if (cls.includes('min-h-') && cls.includes('border') &&
+                               el.offsetParent && el.offsetWidth > 50) {
+                            candidates.push(el);
+                        }
+                    });
+
+                    if (candidates.length === 0) return {found: false};
+
+                    // Dispatch hover events on ALL candidates (one of them is the real target)
+                    for (const el of candidates) {
+                        const rect = el.getBoundingClientRect();
+                        const cx = rect.x + rect.width / 2;
+                        const cy = rect.y + rect.height / 2;
+                        const opts = {bubbles: true, cancelable: true, clientX: cx, clientY: cy};
+                        el.dispatchEvent(new MouseEvent('mouseenter', opts));
+                        el.dispatchEvent(new MouseEvent('mouseover', opts));
+                        el.dispatchEvent(new MouseEvent('mousemove', opts));
                     }
 
-                    // Strategy 3: min-h element with border (fallback)
-                    if (!best) {
-                        const minHEls = [...document.querySelectorAll('div')].filter(el => {
-                            const cls = el.className || '';
-                            return cls.includes('min-h-') && cls.includes('border') &&
-                                   el.offsetParent && el.offsetWidth > 50;
-                        });
-                        if (minHEls.length > 0) best = minHEls[0];
-                    }
-
-                    if (!best) return {found: false};
-
-                    // Mark for Playwright locator
+                    // Mark the first candidate for Playwright hover
+                    const best = candidates[0];
                     best.setAttribute('data-hover-target', 'true');
                     best.scrollIntoView({behavior: 'instant', block: 'center'});
-
-                    // Dispatch mouse events directly (React needs mouseenter/mouseover)
                     const rect = best.getBoundingClientRect();
-                    const cx = rect.x + rect.width / 2;
-                    const cy = rect.y + rect.height / 2;
-                    const opts = {bubbles: true, cancelable: true, clientX: cx, clientY: cy};
-                    best.dispatchEvent(new MouseEvent('mouseenter', opts));
-                    best.dispatchEvent(new MouseEvent('mouseover', opts));
-                    best.dispatchEvent(new MouseEvent('mousemove', opts));
-
-                    return {x: cx, y: cy, found: true};
+                    return {x: rect.x + rect.width/2, y: rect.y + rect.height/2, found: true, count: candidates.length};
                 }
             """)
 
             if not target_info.get('found'):
                 return False
 
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
 
-            # Step 3: Use Playwright .hover() for full event chain (mouseenter+mouseover+mousemove)
+            # Step 3: Use Playwright .hover() for full event chain
             x, y = target_info['x'], target_info['y']
             try:
                 el = self.browser.page.locator('[data-hover-target="true"]')
                 if await el.count() > 0:
                     await el.first.hover(timeout=2000)
             except Exception:
-                # Fallback to mouse.move
                 await self.browser.page.mouse.move(x, y)
 
             print(f"    -> hovering at ({x:.0f}, {y:.0f})", flush=True)
-            # Hold hover for 2 seconds (challenge typically requires 1s)
-            await asyncio.sleep(2.0)
+            # Hold hover for 1.3 seconds (challenge requires 1s)
+            await asyncio.sleep(1.3)
 
             # Clean up marker
             try:
@@ -2470,13 +2503,10 @@ class ChallengeSolver:
 
             url_before = await self.browser.get_url()
 
-            # Try each pattern - multiple may exist but only one is correct
+            # Try each pattern - use case-insensitive to avoid duplicates
             patterns = [
-                'Correct answer', 'correct answer',
-                'This is correct', 'this is correct',
-                'The right choice', 'the right choice',
-                'Correct Choice', 'correct choice',
-                'Right answer', 'right answer',
+                'Correct answer', 'This is correct', 'The right choice',
+                'Correct Choice', 'Right answer',
             ]
             any_clicked = False
             for pattern in patterns:
@@ -2487,7 +2517,6 @@ class ChallengeSolver:
                         await locator.first.click(timeout=1000)
                         print(f"    -> Playwright clicked option: '{pattern}'", flush=True)
                         any_clicked = True
-                        await asyncio.sleep(0.3)
 
                         # Click Submit & Continue
                         submitted = False
@@ -2506,7 +2535,7 @@ class ChallengeSolver:
 
                         if submitted:
                             print(f"    -> Clicked Submit & Continue", flush=True)
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(0.2)
                             url_after = await self.browser.get_url()
                             if url_after != url_before:
                                 print(f"    -> Option '{pattern}' was correct!", flush=True)
