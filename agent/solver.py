@@ -1225,61 +1225,168 @@ class ChallengeSolver:
             return False
 
     async def _try_sequence_challenge(self) -> bool:
-        """Handle Sequence Challenge - click action button repeatedly until progress completes."""
+        """Handle Sequence Challenge - perform 4 actions: click, hover, type, scroll."""
         try:
-            for click_num in range(20):
-                # Check progress state
-                state = await self.browser.page.evaluate("""
-                    () => {
-                        const text = document.body.textContent || '';
-                        // Parse "Progress: 2/4" or "2/4 complete" or "Step 2 of 4"
-                        const progMatch = text.match(/(\\d+)\\s*\\/\\s*(\\d+)/);
-                        const done = progMatch ? parseInt(progMatch[1]) : 0;
-                        const total = progMatch ? parseInt(progMatch[2]) : 4;
+            # Detect which actions are needed and their completion status
+            state = await self.browser.page.evaluate("""
+                () => {
+                    const text = document.body.textContent || '';
+                    const progMatch = text.match(/(\\d+)\\s*\\/\\s*(\\d+)/);
+                    const done = progMatch ? parseInt(progMatch[1]) : 0;
+                    const total = progMatch ? parseInt(progMatch[2]) : 4;
 
-                        // Find clickable action button (not Submit, not navigation)
-                        const btns = [...document.querySelectorAll('button')];
-                        let actionBtn = null;
-                        for (const btn of btns) {
-                            const t = (btn.textContent || '').trim().toLowerCase();
-                            if (btn.offsetParent && !btn.disabled &&
-                                !t.includes('submit') && !t.includes('next') &&
-                                (t.includes('click') || t.includes('tap') ||
-                                 t.includes('press') || t.includes('action') ||
-                                 t.includes('go') || t.includes('do it'))) {
-                                actionBtn = t;
-                                btn.click();
-                                return {done, total, clicked: t, complete: done >= total};
-                            }
+                    // Detect action items and their completion status
+                    const actions = [];
+                    // Look for action labels (pill-shaped items showing completion)
+                    const allEls = [...document.querySelectorAll('span, div, button, li')];
+                    for (const el of allEls) {
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        const hasCheck = t.includes('✓') || t.includes('✔') || t.includes('☑');
+                        if (t.includes('click button') || t.includes('click me')) {
+                            actions.push({type: 'click', done: hasCheck, text: t});
+                        } else if (t.includes('hover')) {
+                            actions.push({type: 'hover', done: hasCheck, text: t});
+                        } else if (t.includes('type text') || t.includes('type here')) {
+                            actions.push({type: 'type', done: hasCheck, text: t});
+                        } else if (t.includes('scroll box') || t.includes('scroll inside')) {
+                            actions.push({type: 'scroll', done: hasCheck, text: t});
                         }
-                        // Fallback: click any non-submit, non-nav colored button
-                        for (const btn of btns) {
-                            const t = (btn.textContent || '').trim().toLowerCase();
-                            const cls = btn.className || '';
-                            if (btn.offsetParent && !btn.disabled &&
-                                !t.includes('submit') && !t.includes('next') &&
-                                (cls.includes('violet') || cls.includes('purple') ||
-                                 cls.includes('blue') || cls.includes('cyan') ||
-                                 cls.includes('indigo'))) {
-                                btn.click();
-                                return {done, total, clicked: t, complete: done >= total};
-                            }
-                        }
-                        return {done, total, clicked: null, complete: done >= total};
                     }
-                """)
-                print(f"    -> sequence: {state.get('done')}/{state.get('total')}, "
-                      f"clicked={state.get('clicked')}", flush=True)
+                    return {done, total, actions};
+                }
+            """)
+            print(f"    -> sequence state: {state.get('done')}/{state.get('total')}, "
+                  f"actions={state.get('actions')}", flush=True)
 
-                if state.get('complete'):
-                    await asyncio.sleep(0.5)
-                    return True
+            # Action 1: Click the "Click Me" button (if not done)
+            click_done = await self.browser.page.evaluate("""
+                () => {
+                    const btns = [...document.querySelectorAll('button')];
+                    for (const btn of btns) {
+                        const t = (btn.textContent || '').trim().toLowerCase();
+                        if (t.includes('click me') && btn.offsetParent && !btn.disabled) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if click_done:
+                print(f"    -> clicked 'Click Me' button", flush=True)
+            await asyncio.sleep(0.3)
 
-                if state.get('clicked') is None:
-                    # No action button found - try generic click
-                    break
+            # Action 2: Hover over the hover area
+            hover_done = await self.browser.page.evaluate("""
+                () => {
+                    const els = [...document.querySelectorAll('div, span, p')];
+                    for (const el of els) {
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        if (t.includes('hover over') && el.offsetParent) {
+                            el.scrollIntoView({behavior: 'instant', block: 'center'});
+                            const rect = el.getBoundingClientRect();
+                            return {found: true, x: rect.x + rect.width/2, y: rect.y + rect.height/2};
+                        }
+                    }
+                    return {found: false};
+                }
+            """)
+            if hover_done.get('found'):
+                await self.browser.page.mouse.move(hover_done['x'], hover_done['y'])
+                await asyncio.sleep(1.0)
+                print(f"    -> hovered over area", flush=True)
 
-                await asyncio.sleep(0.5)
+            # Action 3: Type text in the input field
+            type_done = await self.browser.page.evaluate("""
+                () => {
+                    const inputs = document.querySelectorAll('input[type="text"], input:not([type])');
+                    for (const inp of inputs) {
+                        const ph = (inp.placeholder || '').toLowerCase();
+                        if ((ph.includes('type') || ph.includes('click')) && inp.offsetParent) {
+                            inp.scrollIntoView({behavior: 'instant', block: 'center'});
+                            const rect = inp.getBoundingClientRect();
+                            return {found: true, x: rect.x + rect.width/2, y: rect.y + rect.height/2};
+                        }
+                    }
+                    return {found: false};
+                }
+            """)
+            if type_done.get('found'):
+                await self.browser.page.mouse.click(type_done['x'], type_done['y'])
+                await asyncio.sleep(0.2)
+                await self.browser.page.keyboard.type("hello", delay=50)
+                print(f"    -> typed text in input", flush=True)
+                await asyncio.sleep(0.3)
+
+            # Action 4: Scroll inside the scroll box
+            scroll_done = await self.browser.page.evaluate("""
+                () => {
+                    const els = [...document.querySelectorAll('div, textarea')];
+                    for (const el of els) {
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        const style = getComputedStyle(el);
+                        const isScrollable = style.overflow === 'auto' || style.overflow === 'scroll' ||
+                            style.overflowY === 'auto' || style.overflowY === 'scroll';
+                        if (t.includes('scroll inside') && isScrollable && el.offsetParent) {
+                            el.scrollIntoView({behavior: 'instant', block: 'center'});
+                            el.scrollTop = el.scrollHeight;
+                            const rect = el.getBoundingClientRect();
+                            return {found: true, x: rect.x + rect.width/2, y: rect.y + rect.height/2};
+                        }
+                    }
+                    // Fallback: find any scrollable div that's not the page
+                    for (const el of els) {
+                        const style = getComputedStyle(el);
+                        const isScrollable = style.overflow === 'auto' || style.overflow === 'scroll' ||
+                            style.overflowY === 'auto' || style.overflowY === 'scroll';
+                        if (isScrollable && el.scrollHeight > el.clientHeight + 10 &&
+                            el.offsetParent && el.clientHeight < 400 && el.clientHeight > 30) {
+                            el.scrollIntoView({behavior: 'instant', block: 'center'});
+                            el.scrollTop = el.scrollHeight;
+                            const rect = el.getBoundingClientRect();
+                            return {found: true, x: rect.x + rect.width/2, y: rect.y + rect.height/2};
+                        }
+                    }
+                    return {found: false};
+                }
+            """)
+            if scroll_done.get('found'):
+                # Also use mouse wheel for more realistic scroll
+                await self.browser.page.mouse.move(scroll_done['x'], scroll_done['y'])
+                await self.browser.page.mouse.wheel(0, 300)
+                await asyncio.sleep(0.3)
+                print(f"    -> scrolled inside box", flush=True)
+
+            await asyncio.sleep(0.5)
+
+            # Click Complete button
+            complete_clicked = await self.browser.page.evaluate("""
+                () => {
+                    const btns = [...document.querySelectorAll('button')];
+                    for (const btn of btns) {
+                        const t = (btn.textContent || '').trim().toLowerCase();
+                        if (t.includes('complete') && btn.offsetParent && !btn.disabled) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if complete_clicked:
+                print(f"    -> clicked Complete", flush=True)
+            await asyncio.sleep(0.5)
+
+            # Check final progress
+            final = await self.browser.page.evaluate("""
+                () => {
+                    const text = document.body.textContent || '';
+                    const progMatch = text.match(/(\\d+)\\s*\\/\\s*(\\d+)/);
+                    return {done: progMatch ? parseInt(progMatch[1]) : 0,
+                            total: progMatch ? parseInt(progMatch[2]) : 4};
+                }
+            """)
+            print(f"    -> final progress: {final.get('done')}/{final.get('total')}", flush=True)
 
             return True
         except Exception as e:
