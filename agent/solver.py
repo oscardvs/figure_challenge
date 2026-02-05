@@ -1458,32 +1458,76 @@ class ChallengeSolver:
             """)
             await asyncio.sleep(0.3)
 
-            # Step 3: Click Solve button - scroll into view first, don't require offsetParent
+            # Step 3: Click Solve button - try multiple approaches
+            # First focus number input and scroll it visible
+            await self.browser.page.evaluate("""
+                () => {
+                    const input = document.querySelector('input[type="number"]') ||
+                                  document.querySelector('input[inputmode="numeric"]');
+                    if (input) {
+                        input.scrollIntoView({behavior: 'instant', block: 'center'});
+                        input.focus();
+                    }
+                }
+            """)
+            await asyncio.sleep(0.1)
+
+            # Debug: log all button texts on the page
+            btn_debug = await self.browser.page.evaluate("""
+                () => {
+                    const btns = [...document.querySelectorAll('button')];
+                    return btns.map(b => ({
+                        text: b.textContent.trim().substring(0, 30),
+                        disabled: b.disabled,
+                        visible: !!b.offsetParent
+                    })).filter(b => b.text.length > 0).slice(0, 10);
+                }
+            """)
+            print(f"    -> buttons on page: {btn_debug}", flush=True)
+
+            # Try clicking Solve via JS - very broad matching
             solved = await self.browser.page.evaluate("""
                 () => {
                     const btns = [...document.querySelectorAll('button')];
                     for (const btn of btns) {
                         const t = (btn.textContent || '').trim().toLowerCase();
-                        if ((t.includes('solve') || t === 'check' || t === 'verify' ||
-                             t === 'answer') && !btn.disabled) {
+                        if (t.includes('solve') && !btn.disabled) {
                             btn.scrollIntoView({behavior: 'instant', block: 'center'});
                             btn.click();
-                            return true;
+                            return 'js_click: ' + t;
+                        }
+                    }
+                    // Second pass: pink/rose colored button
+                    for (const btn of btns) {
+                        const cls = btn.className || '';
+                        const t = (btn.textContent || '').trim().toLowerCase();
+                        if ((cls.includes('pink') || cls.includes('rose') || cls.includes('red')) &&
+                            !t.includes('submit') && !btn.disabled && t.length < 20) {
+                            btn.scrollIntoView({behavior: 'instant', block: 'center'});
+                            btn.click();
+                            return 'color_click: ' + t;
                         }
                     }
                     return false;
                 }
             """)
-            print(f"    -> solve clicked: {solved}", flush=True)
+            print(f"    -> solve result: {solved}", flush=True)
 
             if not solved:
-                # Fallback: try Playwright click
-                try:
-                    await self.browser.page.click("button:has-text('Solve')", timeout=2000)
-                    print(f"    -> Playwright clicked Solve", flush=True)
-                    solved = True
-                except Exception:
-                    pass
+                # Press Enter on the focused number input
+                await self.browser.page.keyboard.press('Enter')
+                print(f"    -> pressed Enter on puzzle input", flush=True)
+
+            if not solved:
+                # Playwright fallback
+                for text in ['Solve', 'Check', 'Verify']:
+                    try:
+                        await self.browser.page.click(f"button:has-text('{text}')", timeout=1000)
+                        print(f"    -> Playwright clicked '{text}'", flush=True)
+                        solved = True
+                        break
+                    except Exception:
+                        continue
 
             await asyncio.sleep(1.0)
             return True
@@ -2317,33 +2361,34 @@ class ChallengeSolver:
 
         for code in codes:
             try:
-                # Scroll the code input into view and focus it via JS first
-                # This avoids issues with number inputs or other fields stealing focus
-                focused = await self.browser.page.evaluate("""
+                # Scroll the code input into view via JS first
+                await self.browser.page.evaluate("""
                     () => {
-                        // Find code input specifically (not number inputs from puzzles)
-                        const selectors = [
-                            'input[placeholder*="code" i]',
-                            'input[placeholder*="enter" i][type="text"]',
-                            'input[type="text"]:not([type="number"])',
-                        ];
-                        for (const sel of selectors) {
-                            const input = document.querySelector(sel);
-                            if (input && input.offsetParent) {
-                                input.scrollIntoView({behavior: 'instant', block: 'center'});
-                                input.focus();
-                                input.select();
-                                return true;
-                            }
-                        }
-                        return false;
+                        const input = document.querySelector('input[placeholder*="code"], input[placeholder*="Code"], input[type="text"]');
+                        if (input) input.scrollIntoView({behavior: 'instant', block: 'center'});
                     }
                 """)
-                if not focused:
+                await asyncio.sleep(0.1)
+
+                # Find the input field
+                input_loc = self.browser.page.locator(
+                    'input[placeholder*="code"], input[placeholder*="Code"], input[type="text"]'
+                ).first
+                if not await input_loc.count():
                     print(f"    -> no input field found", flush=True)
                     return False
 
-                await asyncio.sleep(0.1)
+                # Clear properly for React: triple-click to select all, then backspace
+                try:
+                    await input_loc.click(click_count=3, timeout=1000)
+                except Exception:
+                    # Fallback: floating elements may block click - use JS focus + select
+                    await self.browser.page.evaluate("""
+                        () => {
+                            const input = document.querySelector('input[placeholder*="code"], input[placeholder*="Code"], input[type="text"]');
+                            if (input) { input.focus(); input.select(); }
+                        }
+                    """)
                 await self.browser.page.keyboard.press('Backspace')
                 await asyncio.sleep(0.1)
 
