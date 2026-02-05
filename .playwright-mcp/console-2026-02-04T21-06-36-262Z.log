@@ -1,0 +1,23 @@
+[  347796ms] [ERROR] NotFoundError: Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.
+    at Nc (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:26221)
+    at Zt (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:25908)
+    at Nc (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:26669)
+    at wt (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:27523)
+    at jc (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:30723)
+    at wt (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:27673)
+    at jc (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:27983)
+    at wt (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:27673)
+    at jc (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:27786)
+    at wt (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:27673) @ https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:39
+[  347797ms] NotFoundError: Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.
+    at Nc (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:26221)
+    at Zt (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:25908)
+    at Nc (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:26669)
+    at wt (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:27523)
+    at jc (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:30723)
+    at wt (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:27673)
+    at jc (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:27983)
+    at wt (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:27673)
+    at jc (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:27786)
+    at wt (https://serene-frangipane-7fd25b.netlify.app/assets/index-BKEDqiCY.js:40:27673)
+[  376434ms] [ERROR] Failed to load resource: the server responded with a status of 404 () @ https://serene-frangipane-7fd25b.netlify.app/step3?version=1:0

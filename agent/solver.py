@@ -28,10 +28,17 @@ class ChallengeSolver:
         await self.browser.start(start_url, headless=headless)
 
         try:
-            # Click START button
+            # Wait for page to load and click START button
+            await asyncio.sleep(2)
+            print("Clicking START button...", flush=True)
+            start_clicked = await self.browser.click_by_text("START")
+            if not start_clicked:
+                # Try alternative selectors
+                start_clicked = await self.browser.click("button:has-text('Start')")
+            if not start_clicked:
+                start_clicked = await self.browser.click("a:has-text('Start')")
+            print(f"START clicked: {start_clicked}")
             await asyncio.sleep(1)
-            await self.browser.click_by_text("START")
-            await asyncio.sleep(0.5)
 
             for challenge_num in range(1, 31):
                 self.current_challenge = challenge_num
@@ -54,74 +61,1235 @@ class ChallengeSolver:
 
         return self.metrics.get_summary()
 
+    async def _wait_for_content(self) -> bool:
+        """Wait for React SPA to render content. Returns True if content loaded."""
+        for wait_attempt in range(10):
+            html = await self.browser.get_html()
+            # Check if page has meaningful content (not just the React shell)
+            has_buttons = 'button' in html.lower()
+            has_input = 'input' in html.lower()
+            has_step = f'step' in html.lower()
+            if len(html) > 1000 and (has_buttons or has_input or has_step):
+                return True
+            print(f"  (waiting for content... {len(html)} chars, attempt {wait_attempt+1})", flush=True)
+            await asyncio.sleep(0.5)
+        return False
+
     async def _solve_challenge(self, challenge_num: int) -> bool:
-        """Solve a single challenge with optimizations."""
+        """Solve challenge using brute-force + DOM parsing (fast, no vision)."""
         total_tokens_in = 0
         total_tokens_out = 0
 
-        for attempt in range(self.max_attempts_per_challenge):
-            # Parallel: get screenshot and HTML simultaneously
-            screenshot_task = asyncio.create_task(self.browser.screenshot())
-            html_task = asyncio.create_task(self.browser.get_html())
-            url_task = asyncio.create_task(self.browser.get_url())
+        # Wait for React to render the page content
+        content_loaded = await self._wait_for_content()
+        if not content_loaded:
+            print(f"  WARNING: page content didn't load, continuing anyway", flush=True)
 
-            screenshot, html, url = await asyncio.gather(
-                screenshot_task, html_task, url_task
-            )
+        for attempt in range(20):  # More attempts, faster
+            url = await self.browser.get_url()
+            print(f"  [{attempt+1}] url={url[-35:]}", flush=True)
 
             # Check if moved to next challenge
             if self._check_progress(url, challenge_num):
                 self.metrics.end_challenge(
-                    challenge_num,
-                    success=True,
-                    tokens_in=total_tokens_in,
-                    tokens_out=total_tokens_out
+                    challenge_num, success=True,
+                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
                 )
-                print(f"Challenge {challenge_num} PASSED")
+                print(f"  >>> PASSED <<<", flush=True)
                 return True
 
-            # Fast path: DOM code extraction (no API call)
+            # Handle special challenges (modals, click-to-reveal elements)
+            special = await self._handle_special_challenges()
+            if special.get('handled'):
+                print(f"  special: {special}", flush=True)
+
+            # Use Playwright native clicks for radio/option selection (JS clicks don't trigger React)
+            if special.get('modal_scrolled') or special.get('modal_closed'):
+                radio_result = await self._try_radio_selection()
+                if radio_result:
+                    print(f"  radio_selected: True", flush=True)
+                    await asyncio.sleep(0.5)
+                    url = await self.browser.get_url()
+                    if self._check_progress(url, challenge_num):
+                        self.metrics.end_challenge(
+                            challenge_num, success=True,
+                            tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                        )
+                        print(f"  >>> PASSED <<<", flush=True)
+                        return True
+
+            # If a countdown timer was detected, wait for it to finish (only first 3 attempts)
+            if special.get('has_timer') and special.get('timer_seconds', 0) > 0 and attempt < 3:
+                wait_secs = special['timer_seconds'] + 1  # +1 for safety margin
+                print(f"  timer detected: {special['timer_seconds']}s remaining, waiting {wait_secs}s...", flush=True)
+                await asyncio.sleep(wait_secs)
+                # Re-extract codes after timer completes
+                html = await self.browser.get_html()
+                dom_codes = extract_hidden_codes(html)
+                if dom_codes:
+                    print(f"  post-timer codes: {dom_codes}", flush=True)
+                    filled = await self._try_fill_code(dom_codes)
+                    if filled:
+                        url = await self.browser.get_url()
+                        if self._check_progress(url, challenge_num):
+                            self.metrics.end_challenge(
+                                challenge_num, success=True,
+                                tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                            )
+                            print(f"  >>> PASSED <<<", flush=True)
+                            return True
+                continue  # Skip brute force on timer attempts
+
+            # Handle Keyboard Sequence Challenge (press key combos to reveal code)
+            html_check = await self.browser.get_html()
+            if 'keyboard sequence' in html_check.lower() or ('press' in html_check.lower() and 'keys in sequence' in html_check.lower()):
+                kbd_result = await self._try_keyboard_sequence(html_check)
+                if kbd_result:
+                    print(f"  keyboard_sequence: completed", flush=True)
+                    await asyncio.sleep(0.5)
+                    # Re-extract codes after sequence completes
+                    html = await self.browser.get_html()
+                    dom_codes = extract_hidden_codes(html)
+                    if dom_codes:
+                        print(f"  post-keyboard codes: {dom_codes}", flush=True)
+                        filled = await self._try_fill_code(dom_codes)
+                        if filled:
+                            url = await self.browser.get_url()
+                            if self._check_progress(url, challenge_num):
+                                self.metrics.end_challenge(
+                                    challenge_num, success=True,
+                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                )
+                                print(f"  >>> PASSED <<<", flush=True)
+                                return True
+
+            # Handle Drag-and-Drop Challenge (fill slots with pieces to reveal code)
+            html_lower = html_check.lower()
+            if 'drag' in html_lower and 'drop' in html_lower and 'slot' in html_lower:
+                dnd_result = await self._try_drag_and_drop()
+                if dnd_result:
+                    print(f"  drag_and_drop: completed", flush=True)
+                    await asyncio.sleep(0.5)
+                    # Re-extract codes after filling slots
+                    html = await self.browser.get_html()
+                    dom_codes = extract_hidden_codes(html)
+                    if dom_codes:
+                        print(f"  post-dnd codes: {dom_codes}", flush=True)
+                        filled = await self._try_fill_code(dom_codes)
+                        if filled:
+                            url = await self.browser.get_url()
+                            if self._check_progress(url, challenge_num):
+                                self.metrics.end_challenge(
+                                    challenge_num, success=True,
+                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                )
+                                print(f"  >>> PASSED <<<", flush=True)
+                                return True
+
+            # Handle Hover Challenge (hover over element to reveal code)
+            if 'hover' in html_lower and ('reveal' in html_lower or 'code' in html_lower):
+                hover_result = await self._try_hover_challenge()
+                if hover_result:
+                    print(f"  hover_challenge: completed", flush=True)
+                    await asyncio.sleep(0.3)
+                    html = await self.browser.get_html()
+                    dom_codes = extract_hidden_codes(html)
+                    if dom_codes:
+                        print(f"  post-hover codes: {dom_codes}", flush=True)
+                        filled = await self._try_fill_code(dom_codes)
+                        if filled:
+                            url = await self.browser.get_url()
+                            if self._check_progress(url, challenge_num):
+                                self.metrics.end_challenge(
+                                    challenge_num, success=True,
+                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                )
+                                print(f"  >>> PASSED <<<", flush=True)
+                                return True
+
+            # Handle Canvas Challenge (draw 3+ strokes on canvas to reveal code)
+            if 'canvas' in html_lower and ('stroke' in html_lower or 'draw' in html_lower):
+                canvas_result = await self._try_canvas_challenge()
+                if canvas_result:
+                    print(f"  canvas_challenge: completed", flush=True)
+                    await asyncio.sleep(0.5)
+                    html = await self.browser.get_html()
+                    dom_codes = extract_hidden_codes(html)
+                    if dom_codes:
+                        print(f"  post-canvas codes: {dom_codes}", flush=True)
+                        filled = await self._try_fill_code(dom_codes)
+                        if filled:
+                            url = await self.browser.get_url()
+                            if self._check_progress(url, challenge_num):
+                                self.metrics.end_challenge(
+                                    challenge_num, success=True,
+                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                )
+                                print(f"  >>> PASSED <<<", flush=True)
+                                return True
+
+            # Handle Audio Challenge (play audio, click complete to reveal code)
+            if 'audio' in html_lower and ('play' in html_lower or 'listen' in html_lower):
+                audio_result = await self._try_audio_challenge()
+                if audio_result:
+                    print(f"  audio_challenge: completed", flush=True)
+                    await asyncio.sleep(0.5)
+                    html = await self.browser.get_html()
+                    dom_codes = extract_hidden_codes(html)
+                    if dom_codes:
+                        print(f"  post-audio codes: {dom_codes}", flush=True)
+                        filled = await self._try_fill_code(dom_codes)
+                        if filled:
+                            url = await self.browser.get_url()
+                            if self._check_progress(url, challenge_num):
+                                self.metrics.end_challenge(
+                                    challenge_num, success=True,
+                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                )
+                                print(f"  >>> PASSED <<<", flush=True)
+                                return True
+
+            # Scroll page: alternate between bottom and top for scroll challenges
+            if attempt % 2 == 0:
+                await self.browser.page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            else:
+                await self.browser.page.evaluate("() => window.scrollTo(0, 0)")
+
+            # BRUTE FORCE: Click all buttons rapidly via JS
+            clicks = await self._brute_force_click()
+            print(f"  brute_force: {clicks}", flush=True)
+
+            # Small delay for DOM to update after reveal buttons
+            if clicks.get('reveal', 0) > 0 or special.get('reveal_clicked'):
+                await asyncio.sleep(0.3)
+
+            # Check progress again after clicking
+            url = await self.browser.get_url()
+            if self._check_progress(url, challenge_num):
+                self.metrics.end_challenge(
+                    challenge_num, success=True,
+                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                )
+                print(f"  >>> PASSED <<<", flush=True)
+                return True
+
+            # DOM: Extract codes and try to fill
+            html = await self.browser.get_html()
             dom_codes = extract_hidden_codes(html)
-
             if dom_codes:
-                print(f"  Found codes in DOM: {dom_codes}")
+                print(f"  dom_codes: {dom_codes}", flush=True)
                 filled = await self._try_fill_code(dom_codes)
-                if filled:
-                    await asyncio.sleep(0.2)
+                print(f"  filled: {filled}", flush=True)
+            else:
+                print(f"  dom_codes: none found", flush=True)
+                # If page is still blank, wait a bit more
+                if len(html) < 1000:
+                    print(f"  (page still blank, waiting...)", flush=True)
+                    await asyncio.sleep(1)
                     continue
 
-            # Challenge type detection using handlers (no API call)
-            challenge_type = detect_challenge_type(html)
-            if challenge_type != "unknown":
-                print(f"  Detected challenge type: {challenge_type}")
-                handled = await self._handle_challenge_type(challenge_type)
-                if handled:
-                    await asyncio.sleep(0.2)
-                    continue
+            # Use vision every 5th attempt as fallback, with escalating thinking
+            vision_call_num = attempt // 5  # 0th, 1st, 2nd... vision call
+            if attempt > 0 and attempt % 5 == 0:
+                print(f"  vision (call #{vision_call_num})...", flush=True)
+                screenshot = await self.browser.screenshot()
+                action, tin, tout = self.vision.analyze_page(
+                    screenshot, html[:5000], challenge_num, dom_codes,
+                    attempt=vision_call_num
+                )
+                total_tokens_in += tin
+                total_tokens_out += tout
+                print(f"  vision: {action.action_type} -> {action.target_selector}", flush=True)
+                if action.code_found:
+                    print(f"  vision_code: {action.code_found}", flush=True)
+                    await self._try_fill_code([action.code_found])
+                await self._execute_action(action)
 
-            # Quick pattern detection (no API call)
-            quick_action = self._detect_quick_pattern(html)
-            if quick_action:
-                print(f"  Quick pattern: {quick_action}")
-                await self._execute_quick_action(quick_action)
-                await asyncio.sleep(0.2)
-                continue
-
-            # Vision analysis only if needed
-            print(f"  Attempt {attempt + 1}: Analyzing with vision...")
-            action, tokens_in, tokens_out = self.vision.analyze_page(
-                screenshot, html, challenge_num, dom_codes
-            )
-            total_tokens_in += tokens_in
-            total_tokens_out += tokens_out
-
-            print(f"  Action: {action.action_type} -> {action.target_selector}")
-            print(f"  Reasoning: {action.reasoning}")
-
-            await self._execute_action(action)
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)
 
         return False
+
+    async def _handle_special_challenges(self) -> dict:
+        """Handle special challenge patterns: modals, click-to-reveal, overlays, fake popups."""
+        return await self.browser.page.evaluate("""
+            () => {
+                const result = {handled: false, modal_closed: false, reveal_clicked: 0, popups_removed: 0, modal_scrolled: false, has_timer: false, timer_seconds: 0};
+
+                // 0. Handle popups with fake/real close buttons
+                // React needs DOM nodes intact for reconciliation during route transitions.
+                const hideElement = (el) => {
+                    el.style.display = 'none';
+                    el.style.pointerEvents = 'none';
+                    el.style.visibility = 'hidden';
+                    el.style.zIndex = '-1';
+                };
+
+                // 0a. FIRST: Handle popups where one button is real and another is fake
+                // e.g. "Newsletter Signup" with "Close (Fake)" and "Dismiss" buttons
+                // The text says "close button below is fake! Look for the real one."
+                document.querySelectorAll('.fixed, [class*="absolute"], [class*="z-"]').forEach(el => {
+                    const text = el.textContent || '';
+                    // Check for "close button" + "fake" + "real one" pattern (has a real dismiss button)
+                    if (text.includes('fake') && text.includes('real one')) {
+                        const buttons = el.querySelectorAll('button');
+                        buttons.forEach(btn => {
+                            const btnText = (btn.textContent || '').trim();
+                            // Click the button that is NOT labeled as fake
+                            if (!btnText.toLowerCase().includes('fake') &&
+                                btnText.length > 0 && btnText.length < 30) {
+                                btn.click();
+                                result.handled = true;
+                                result.modal_closed = true;
+                            }
+                        });
+                    }
+                });
+
+                // 0b. Hide popups where ALL close buttons are fake
+                // These say "Look for another way to close" (no real button exists)
+                document.querySelectorAll('.fixed, [class*="absolute"], [class*="z-"]').forEach(el => {
+                    const text = el.textContent || '';
+                    if (text.includes('another way to close') ||
+                        (text.includes('close button') && text.includes('fake') && !text.includes('real one')) ||
+                        (text.includes('won a prize') && text.includes('popup')) ||
+                        (text.includes('amazing deals') && text.includes('popup'))) {
+                        hideElement(el);
+                        result.popups_removed++;
+                        result.handled = true;
+                    }
+                });
+
+                // Also hide any "That close button is fake!" warning overlays
+                document.querySelectorAll('.fixed, [class*="absolute"]').forEach(el => {
+                    const text = (el.textContent || '').trim();
+                    if (text.includes('That close button is fake')) {
+                        hideElement(el);
+                        result.popups_removed++;
+                        result.handled = true;
+                    }
+                });
+
+                // 1. Handle scrollable modals - scroll to TOP to reveal radio options
+                // Radio options are typically at the top, with filler text below
+                const scrollContainers = document.querySelectorAll(
+                    '[class*="overflow-y"], [class*="overflow-auto"], [style*="overflow"]'
+                );
+                scrollContainers.forEach(modal => {
+                    if (modal.scrollHeight > modal.clientHeight) {
+                        // Scroll to top first to reveal radio options
+                        modal.scrollTop = 0;
+                        result.modal_scrolled = true;
+                        result.handled = true;
+                    }
+                });
+
+                // Also handle modal-like containers (fixed/absolute with max-height)
+                document.querySelectorAll('.fixed, [role="dialog"]').forEach(modal => {
+                    const scrollable = modal.querySelector('[class*="overflow"], [style*="overflow"]');
+                    if (scrollable && scrollable.scrollHeight > scrollable.clientHeight) {
+                        scrollable.scrollTop = 0;
+                        result.modal_scrolled = true;
+                        result.handled = true;
+                    }
+                });
+
+                // 2. Handle modal with radio/option selection
+                // Multiple strategies since radio buttons may be custom-styled cards
+                let radioSelected = false;
+                const correctPatterns = ['correct', 'right choice', 'right answer'];
+                const isCorrectOption = (text) => {
+                    const t = text.toLowerCase();
+                    return correctPatterns.some(p => t.includes(p)) && !t.includes('wrong');
+                };
+
+                // Strategy 1: Click actual radio inputs AND their containers
+                const radios = document.querySelectorAll('input[type="radio"]');
+                radios.forEach(radio => {
+                    const container = radio.closest('[class*="cursor"], [class*="border"]') ||
+                                      radio.closest('label') || radio.closest('div');
+                    const label = container?.textContent || radio.parentElement?.textContent || '';
+                    if (isCorrectOption(label)) {
+                        radio.click();
+                        if (container) container.click();
+                        radioSelected = true;
+                    }
+                });
+
+                // Strategy 2: Click option cards (custom radio - divs with cursor-pointer)
+                if (!radioSelected) {
+                    document.querySelectorAll('[class*="cursor-pointer"], [role="option"], [role="radio"]').forEach(el => {
+                        const text = (el.textContent || '').trim();
+                        if (isCorrectOption(text) && text.length < 50) {
+                            el.click();
+                            radioSelected = true;
+                        }
+                    });
+                }
+
+                // Strategy 3: Click bordered option-like divs
+                if (!radioSelected) {
+                    document.querySelectorAll('div[class*="border"][class*="rounded"], div[class*="p-"][class*="border"]').forEach(el => {
+                        const text = (el.textContent || '').trim();
+                        if (isCorrectOption(text) && text.length < 50) {
+                            el.click();
+                            radioSelected = true;
+                        }
+                    });
+                }
+
+                if (radioSelected) {
+                    result.handled = true;
+                    result.modal_closed = true;
+                }
+
+                // Click "Submit & Continue" if visible (only if radio was selected)
+                document.querySelectorAll('button').forEach(btn => {
+                    const btnText = btn.textContent || '';
+                    if ((btnText.includes('Submit & Continue') || btnText.includes('Submit and Continue')) && !btn.disabled) {
+                        btn.click();
+                        result.handled = true;
+                    }
+                });
+
+                // 2b. Handle "Modal Dialog" popups with REAL close buttons
+                // These say "Click the button to dismiss" - the Close button actually works
+                document.querySelectorAll('.fixed').forEach(el => {
+                    const text = el.textContent || '';
+                    if (text.includes('Click the button to dismiss') ||
+                        text.includes('interact with this modal')) {
+                        const closeBtn = el.querySelector('button');
+                        if (closeBtn) {
+                            closeBtn.click();
+                            result.handled = true;
+                            result.modal_closed = true;
+                        }
+                    }
+                });
+
+                // 2c. Handle "Wrong Button" modals - click Close to dismiss
+                document.querySelectorAll('.fixed').forEach(el => {
+                    const text = el.textContent || '';
+                    if (text.includes('Wrong Button') || text.includes('Try Again')) {
+                        const closeBtn = el.querySelector('button');
+                        if (closeBtn) {
+                            closeBtn.click();
+                            result.handled = true;
+                        }
+                    }
+                });
+
+                // 2d. Handle "Click X to close" / "Limited time offer" popups
+                document.querySelectorAll('.fixed, [class*="z-"]').forEach(el => {
+                    const text = el.textContent || '';
+                    if (text.includes('Limited time offer') || text.includes('Click X to close') ||
+                        text.includes('popup message')) {
+                        el.querySelectorAll('button').forEach(btn => btn.click());
+                        hideElement(el);
+                        result.popups_removed++;
+                        result.handled = true;
+                    }
+                });
+
+                // 3. Click elements that say "click here X more times to reveal"
+                document.querySelectorAll('div, p, span').forEach(el => {
+                    const text = el.textContent || '';
+                    if (text.includes('click here') && text.includes('to reveal')) {
+                        el.click();
+                        result.reveal_clicked++;
+                        result.handled = true;
+                    }
+                });
+
+                // 4. Remove blocking overlays (bg-black/70) - disable pointer events
+                document.querySelectorAll('.fixed').forEach(el => {
+                    if (el.classList.contains('bg-black/70') ||
+                        el.style.backgroundColor?.includes('rgba(0, 0, 0')) {
+                        if (!el.textContent.includes('Cookie') &&
+                            !el.textContent.includes('Step') &&
+                            !el.querySelector('input[type="radio"]')) {
+                            el.style.pointerEvents = 'none';
+                            result.handled = true;
+                        }
+                    }
+                });
+
+                // 5. Handle countdown/timed reveals - wait for timer to finish
+                // Only match ACTIVE countdowns like "4 seconds remaining", not static text
+                document.querySelectorAll('div, span, p').forEach(el => {
+                    const text = el.textContent || '';
+                    // Check both patterns: "X seconds remaining/left" and "countdown: X seconds"
+                    const timerMatch = text.match(/(\\d+)\\s*second[s]?\\s*(?:remaining|left)/i);
+                    const altMatch = text.match(/countdown[:\\s]*(\\d+)\\s*second/i);
+                    const match = timerMatch || altMatch;
+                    if (!match) return;
+                    const secs = parseInt(match[1]);
+                    if (secs > 0 && secs <= 10) {
+                        result.has_timer = true;
+                        result.timer_seconds = secs;
+                        result.handled = true;
+                    }
+                });
+
+                // 6. Close popups with red X buttons (real close buttons)
+                document.querySelectorAll('button').forEach(btn => {
+                    if (btn.querySelector('img') || btn.querySelector('svg')) {
+                        const style = getComputedStyle(btn);
+                        const bg = style.backgroundColor;
+                        const match = bg.match(/rgb\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+                        if (match) {
+                            const [_, r, g, b] = match.map(Number);
+                            if (r > 180 && g < 100 && b < 100) {
+                                btn.click();
+                                result.handled = true;
+                            }
+                        }
+                    }
+                });
+
+                return result;
+            }
+        """)
+
+    async def _try_keyboard_sequence(self, html: str) -> bool:
+        """Handle Keyboard Sequence Challenge - press key combos to reveal code."""
+        try:
+            import re as _re
+            # Parse required keys from HTML
+            # Look for patterns like "Control+A", "Control+C", "Control+V", "Shift+K", etc.
+            key_pattern = _re.compile(r'((?:Control|Shift|Alt|Meta)\+[A-Za-z0-9])')
+            keys = key_pattern.findall(html)
+            if not keys:
+                return False
+
+            # Deduplicate while preserving order (the sequence shown on page)
+            seen = set()
+            unique_keys = []
+            for k in keys:
+                if k not in seen:
+                    seen.add(k)
+                    unique_keys.append(k)
+
+            print(f"    -> keyboard sequence detected: {unique_keys}", flush=True)
+
+            # Focus the page body first
+            await self.browser.page.evaluate("() => document.body.focus()")
+            await asyncio.sleep(0.1)
+
+            # Press each key combo using Playwright (proper keyboard events)
+            for key in unique_keys:
+                await self.browser.page.keyboard.press(key)
+                print(f"    -> pressed: {key}", flush=True)
+                await asyncio.sleep(0.3)
+
+            return True
+        except Exception as e:
+            print(f"    -> keyboard sequence error: {e}", flush=True)
+            return False
+
+    async def _try_hover_challenge(self) -> bool:
+        """Handle Hover Challenge - hover over element for 1+ second to reveal code."""
+        try:
+            # Step 1: Hide ALL floating decoy elements that obstruct hover target
+            await self.browser.page.evaluate("""
+                () => {
+                    const decoyTexts = new Set([
+                        'Click Me!', 'Button!', 'Link!', 'Here!', 'Click Here',
+                        'Click Here!', 'Try This!', 'Move On', 'Keep Going'
+                    ]);
+                    document.querySelectorAll('div, button, a, span').forEach(el => {
+                        const style = getComputedStyle(el);
+                        const text = (el.textContent || '').trim();
+                        if ((style.position === 'absolute' || style.position === 'fixed') &&
+                            decoyTexts.has(text)) {
+                            el.style.display = 'none';
+                            el.style.pointerEvents = 'none';
+                            el.style.visibility = 'hidden';
+                        }
+                    });
+                }
+            """)
+            await asyncio.sleep(0.3)
+
+            # Step 2: Find the hover target element and scroll it into view
+            target_info = await self.browser.page.evaluate("""
+                () => {
+                    // Strategy 1: cursor-pointer element inside hover section
+                    const cursorEls = [...document.querySelectorAll('[class*="cursor-pointer"]')].filter(el => {
+                        return el.offsetParent && el.offsetWidth > 50 && el.offsetHeight > 30;
+                    });
+                    // Strategy 2: bordered box element
+                    const borderEls = [...document.querySelectorAll('div')].filter(el => {
+                        const cls = el.className || '';
+                        return cls.includes('border-2') && cls.includes('rounded') &&
+                               el.offsetParent && el.offsetWidth > 50;
+                    });
+                    // Strategy 3: min-h element with border
+                    const minHEls = [...document.querySelectorAll('div')].filter(el => {
+                        const cls = el.className || '';
+                        return cls.includes('min-h-') && cls.includes('border') &&
+                               el.offsetParent && el.offsetWidth > 50;
+                    });
+
+                    const candidates = [...cursorEls, ...borderEls, ...minHEls];
+                    if (candidates.length > 0) {
+                        const el = candidates[0];
+                        el.scrollIntoView({behavior: 'instant', block: 'center'});
+                        const rect = el.getBoundingClientRect();
+                        return {x: rect.x + rect.width/2, y: rect.y + rect.height/2, found: true};
+                    }
+                    return {found: false};
+                }
+            """)
+
+            if not target_info.get('found'):
+                return False
+
+            await asyncio.sleep(0.3)
+
+            # Step 3: Hover using mouse.move for precise control
+            x, y = target_info['x'], target_info['y']
+            await self.browser.page.mouse.move(x, y)
+            print(f"    -> hovering at ({x:.0f}, {y:.0f})", flush=True)
+            # Hold hover for 2 seconds (challenge typically requires 1s)
+            await asyncio.sleep(2.0)
+
+            return True
+        except Exception as e:
+            print(f"    -> hover error: {e}", flush=True)
+            return False
+
+    async def _try_canvas_challenge(self) -> bool:
+        """Handle Canvas Challenge - draw 3+ mouse strokes on a canvas to reveal code."""
+        try:
+            # Find the canvas element and get its bounding box
+            canvas_info = await self.browser.page.evaluate("""
+                () => {
+                    const canvas = document.querySelector('canvas');
+                    if (!canvas) return {found: false};
+                    canvas.scrollIntoView({behavior: 'instant', block: 'center'});
+                    const rect = canvas.getBoundingClientRect();
+                    return {found: true, x: rect.x, y: rect.y, w: rect.width, h: rect.height};
+                }
+            """)
+
+            if not canvas_info.get('found'):
+                print(f"    -> no canvas element found", flush=True)
+                return False
+
+            cx = canvas_info['x']
+            cy = canvas_info['y']
+            cw = canvas_info['w']
+            ch = canvas_info['h']
+            print(f"    -> canvas found at ({cx:.0f},{cy:.0f}) size {cw:.0f}x{ch:.0f}", flush=True)
+
+            # Draw 4 strokes (one extra for safety) - each stroke is mousedown → mousemove → mouseup
+            for i in range(4):
+                # Vary start/end positions so strokes are different
+                start_x = cx + cw * 0.2 + (i * cw * 0.15)
+                start_y = cy + ch * 0.3 + (i * ch * 0.1)
+                end_x = cx + cw * 0.5 + (i * cw * 0.1)
+                end_y = cy + ch * 0.7 - (i * ch * 0.05)
+
+                await self.browser.page.mouse.move(start_x, start_y)
+                await self.browser.page.mouse.down()
+                await asyncio.sleep(0.05)
+                # Move in steps to simulate actual drawing
+                await self.browser.page.mouse.move(end_x, end_y, steps=10)
+                await asyncio.sleep(0.05)
+                await self.browser.page.mouse.up()
+                print(f"    -> drew stroke {i+1}", flush=True)
+                await asyncio.sleep(0.3)
+
+            # Wait for code to appear after strokes
+            await asyncio.sleep(0.5)
+            return True
+
+        except Exception as e:
+            print(f"    -> canvas error: {e}", flush=True)
+            return False
+
+    async def _try_audio_challenge(self) -> bool:
+        """Handle Audio Challenge - capture audio via network + JS monkey-patch, transcribe with Gemini."""
+        try:
+            import base64
+            from google.genai import types
+
+            # Strategy 1: Monkey-patch Audio.prototype.play to capture src and reference
+            # This catches audio created via new Audio() that isn't in DOM
+            await self.browser.page.evaluate("""
+                () => {
+                    if (window.__audioPatched) return;
+                    window.__audioPatched = true;
+                    window.__capturedAudioSrc = null;
+                    window.__capturedAudio = null;
+                    const origPlay = HTMLAudioElement.prototype.play;
+                    HTMLAudioElement.prototype.play = function() {
+                        window.__capturedAudioSrc = this.src || this.currentSrc;
+                        window.__capturedAudio = this;
+                        return origPlay.call(this);
+                    };
+                }
+            """)
+
+            # Strategy 2: Set up network response listener
+            audio_capture = {'data': None, 'mime': None}
+
+            async def on_audio_response(response):
+                ct = response.headers.get('content-type', '')
+                url = response.url
+                is_audio = ('audio' in ct or
+                            any(ext in url.lower() for ext in ['.mp3', '.wav', '.ogg', '.webm', '.m4a']))
+                if is_audio:
+                    try:
+                        body = await response.body()
+                        audio_capture['data'] = body
+                        audio_capture['mime'] = ct.split(';')[0] if ct else 'audio/mpeg'
+                        print(f"    -> captured audio via network: {len(body)} bytes", flush=True)
+                    except Exception:
+                        pass
+
+            self.browser.page.on('response', on_audio_response)
+
+            # Click Play Audio button
+            play_result = await self.browser.page.evaluate("""
+                () => {
+                    const btns = [...document.querySelectorAll('button')];
+                    for (const btn of btns) {
+                        const text = (btn.textContent || '').trim().toLowerCase();
+                        if ((text.includes('play') || text.includes('audio')) && btn.offsetParent) {
+                            btn.click();
+                            return 'clicked';
+                        }
+                    }
+                    for (const btn of btns) {
+                        const text = (btn.textContent || '').trim().toLowerCase();
+                        if (text.includes('playing')) return 'already_playing';
+                    }
+                    return 'not_found';
+                }
+            """)
+            if play_result == 'not_found':
+                self.browser.page.remove_listener('response', on_audio_response)
+                print(f"    -> no Play Audio button found", flush=True)
+                return False
+            print(f"    -> audio: {play_result}", flush=True)
+
+            # Wait for audio to be captured via network interception
+            for _ in range(10):
+                if audio_capture['data']:
+                    break
+                await asyncio.sleep(0.5)
+
+            # Fallback 1: Use monkey-patched Audio src to fetch audio directly
+            if not audio_capture['data']:
+                print(f"    -> network capture missed, trying JS monkey-patch fallback...", flush=True)
+                audio_info = await self.browser.page.evaluate("""
+                    async () => {
+                        const src = window.__capturedAudioSrc;
+                        if (!src) return {found: false, reason: 'no captured src'};
+                        try {
+                            const resp = await fetch(src);
+                            const ct = resp.headers.get('content-type') || 'audio/mpeg';
+                            const ab = await resp.arrayBuffer();
+                            const bytes = new Uint8Array(ab);
+                            let bin = '';
+                            for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+                            return {found: true, data: btoa(bin), mime: ct};
+                        } catch(e) { return {found: false, error: e.message}; }
+                    }
+                """)
+                if audio_info.get('found'):
+                    audio_capture['data'] = base64.b64decode(audio_info['data'])
+                    audio_capture['mime'] = audio_info.get('mime', 'audio/mpeg').split(';')[0]
+                    print(f"    -> captured audio via JS: {len(audio_capture['data'])} bytes", flush=True)
+                else:
+                    print(f"    -> JS fallback: {audio_info}", flush=True)
+
+            # Fallback 2: Performance API - find audio resources already loaded
+            if not audio_capture['data']:
+                print(f"    -> trying Performance API fallback...", flush=True)
+                audio_info = await self.browser.page.evaluate("""
+                    async () => {
+                        const entries = performance.getEntriesByType('resource');
+                        for (const entry of entries) {
+                            if (entry.name.match(/\\.(mp3|wav|ogg|webm|m4a)/i)) {
+                                try {
+                                    const resp = await fetch(entry.name);
+                                    const ct = resp.headers.get('content-type') || 'audio/mpeg';
+                                    const ab = await resp.arrayBuffer();
+                                    const bytes = new Uint8Array(ab);
+                                    let bin = '';
+                                    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+                                    return {found: true, data: btoa(bin), mime: ct, url: entry.name};
+                                } catch(e) {}
+                            }
+                        }
+                        return {found: false};
+                    }
+                """)
+                if audio_info.get('found'):
+                    audio_capture['data'] = base64.b64decode(audio_info['data'])
+                    audio_capture['mime'] = audio_info.get('mime', 'audio/mpeg').split(';')[0]
+                    print(f"    -> captured audio via Performance API: {len(audio_capture['data'])} bytes", flush=True)
+
+            # Fallback 3: DOM querySelector (audio might be in DOM on some versions)
+            if not audio_capture['data']:
+                audio_info = await self.browser.page.evaluate("""
+                    async () => {
+                        const audio = document.querySelector('audio');
+                        if (!audio) return {found: false};
+                        const src = audio.src || audio.currentSrc || (audio.querySelector('source') || {}).src;
+                        if (!src) return {found: false};
+                        try {
+                            const resp = await fetch(src);
+                            const ct = resp.headers.get('content-type') || 'audio/mpeg';
+                            const ab = await resp.arrayBuffer();
+                            const bytes = new Uint8Array(ab);
+                            let bin = '';
+                            for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+                            return {found: true, data: btoa(bin), mime: ct};
+                        } catch(e) { return {found: false, error: e.message}; }
+                    }
+                """)
+                if audio_info.get('found'):
+                    audio_capture['data'] = base64.b64decode(audio_info['data'])
+                    audio_capture['mime'] = audio_info.get('mime', 'audio/mpeg').split(';')[0]
+                    print(f"    -> captured audio via DOM: {len(audio_capture['data'])} bytes", flush=True)
+
+            self.browser.page.remove_listener('response', on_audio_response)
+
+            # Transcribe with Gemini
+            transcript = None
+            if audio_capture['data']:
+                audio_bytes = audio_capture['data']
+                mime_type = audio_capture['mime'] or 'audio/mpeg'
+                print(f"    -> sending {len(audio_bytes)} bytes ({mime_type}) to Gemini...", flush=True)
+
+                try:
+                    response = self.vision.client.models.generate_content(
+                        model=self.vision.model_name,
+                        contents=[
+                            types.Content(
+                                role="user",
+                                parts=[
+                                    types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+                                    types.Part.from_text(text="Transcribe this audio exactly. It contains a 6-character alphanumeric code being spoken/spelled out. Return ONLY the code (6 characters, letters and numbers), nothing else.")
+                                ]
+                            )
+                        ],
+                        config=types.GenerateContentConfig(temperature=0.0)
+                    )
+                    transcript = response.text.strip()
+                    print(f"    -> audio transcript: '{transcript}'", flush=True)
+                except Exception as e:
+                    print(f"    -> transcription error: {e}", flush=True)
+            else:
+                print(f"    -> FAILED: no audio data captured by any method", flush=True)
+
+            # Force audio to end - use monkey-patched reference (works even if not in DOM)
+            await self.browser.page.evaluate("""
+                () => {
+                    // Try monkey-patched reference first (catches new Audio() objects)
+                    if (window.__capturedAudio) {
+                        window.__capturedAudio.pause();
+                        if (window.__capturedAudio.duration && isFinite(window.__capturedAudio.duration))
+                            window.__capturedAudio.currentTime = window.__capturedAudio.duration;
+                        window.__capturedAudio.dispatchEvent(new Event('ended'));
+                    }
+                    // Also try DOM audio elements
+                    document.querySelectorAll('audio').forEach(a => {
+                        a.pause();
+                        if (a.duration && isFinite(a.duration)) a.currentTime = a.duration;
+                        a.dispatchEvent(new Event('ended'));
+                    });
+                }
+            """)
+            await asyncio.sleep(0.5)
+
+            # Click Complete/Done/Finish button
+            for poll in range(6):
+                await asyncio.sleep(0.5)
+                btn_state = await self.browser.page.evaluate("""
+                    () => {
+                        const btns = [...document.querySelectorAll('button')];
+                        for (const btn of btns) {
+                            const text = (btn.textContent || '').trim().toLowerCase();
+                            if ((text.includes('complete') || text.includes('done') || text.includes('finish')) &&
+                                !text.includes('playing') && btn.offsetParent && !btn.disabled) {
+                                btn.click();
+                                return 'clicked';
+                            }
+                        }
+                        return 'waiting';
+                    }
+                """)
+                if btn_state == 'clicked':
+                    print(f"    -> clicked Complete", flush=True)
+                    break
+                if poll % 2 == 1:
+                    # Retry force-end
+                    await self.browser.page.evaluate("""
+                        () => {
+                            if (window.__capturedAudio) {
+                                window.__capturedAudio.pause();
+                                if (window.__capturedAudio.duration && isFinite(window.__capturedAudio.duration))
+                                    window.__capturedAudio.currentTime = window.__capturedAudio.duration;
+                                window.__capturedAudio.dispatchEvent(new Event('ended'));
+                            }
+                            document.querySelectorAll('audio').forEach(a => {
+                                a.pause();
+                                if (a.duration && isFinite(a.duration)) a.currentTime = a.duration;
+                                a.dispatchEvent(new Event('ended'));
+                            });
+                        }
+                    """)
+
+            # Fallback Playwright click for Complete
+            for text in ['Complete', 'Done', 'Finish']:
+                try:
+                    loc = self.browser.page.get_by_text(text, exact=False)
+                    if await loc.count() > 0:
+                        await loc.first.click(timeout=1000)
+                        print(f"    -> Playwright clicked '{text}'", flush=True)
+                        break
+                except Exception:
+                    continue
+
+            await asyncio.sleep(0.5)
+
+            # Try transcript as code
+            if transcript:
+                import re
+                codes_to_try = []
+                # Clean transcript and look for 6-char codes
+                clean_word = re.sub(r'[^A-Z0-9]', '', transcript.upper())
+                if len(clean_word) == 6:
+                    codes_to_try.insert(0, clean_word)
+                found = re.findall(r'[A-Z0-9]{6}', transcript.upper().replace(' ', ''))
+                codes_to_try.extend(found)
+                # Individual words
+                for w in transcript.upper().split():
+                    w = re.sub(r'[^A-Z0-9]', '', w)
+                    if len(w) == 6 and w not in codes_to_try:
+                        codes_to_try.append(w)
+                # Also try joining first letters of words (if code is spelled out letter by letter)
+                letters = [w.strip().upper() for w in transcript.split() if len(w.strip()) == 1]
+                if len(letters) >= 6:
+                    spelled = ''.join(letters[:6])
+                    if spelled not in codes_to_try:
+                        codes_to_try.append(spelled)
+
+                if codes_to_try:
+                    print(f"    -> audio codes to try: {codes_to_try}", flush=True)
+                    filled = await self._try_fill_code(codes_to_try)
+                    if filled:
+                        return True
+
+            return True
+
+        except Exception as e:
+            print(f"    -> audio error: {e}", flush=True)
+            return False
+
+    async def _try_drag_and_drop(self) -> bool:
+        """Handle Drag-and-Drop Challenge - fill slots with pieces to reveal code."""
+        try:
+            # Step 1: Hide floating decoy elements that obstruct drag area
+            await self.browser.page.evaluate("""
+                () => {
+                    document.querySelectorAll('div, button, a, span').forEach(el => {
+                        const style = getComputedStyle(el);
+                        const text = (el.textContent || '').trim();
+                        if (style.position === 'absolute' || style.position === 'fixed') {
+                            if (['Click Me!', 'Button!', 'Link!', 'Here!', 'Click Here', 'Click Here!', 'Try This!'].includes(text)) {
+                                el.style.display = 'none';
+                                el.style.pointerEvents = 'none';
+                            }
+                        }
+                    });
+                }
+            """)
+            await asyncio.sleep(0.3)
+
+            # Step 2: Try JS-based DragEvent simulation
+            js_result = await self.browser.page.evaluate("""
+                () => {
+                    const pieces = [...document.querySelectorAll('[draggable="true"]')];
+                    if (pieces.length === 0) return {filled: 0, error: 'no pieces'};
+
+                    // Find drop zones - dashed border elements containing "Slot N"
+                    const allDivs = [...document.querySelectorAll('div')];
+                    const slots = allDivs.filter(el => {
+                        const text = (el.textContent || '').trim();
+                        const classes = el.className || '';
+                        const style = el.getAttribute('style') || '';
+                        return (text.match(/^Slot \\d+$/) &&
+                               (classes.includes('dashed') || style.includes('dashed'))) ||
+                               (classes.includes('border-dashed') && el.children.length <= 2 && el.offsetWidth > 40);
+                    });
+
+                    if (slots.length === 0) return {filled: 0, error: 'no slots', pieces: pieces.length};
+
+                    let filled = 0;
+                    const numToFill = Math.min(pieces.length, slots.length, 6);
+
+                    for (let i = 0; i < numToFill; i++) {
+                        try {
+                            const piece = pieces[i];
+                            const slot = slots[i];
+                            const dt = new DataTransfer();
+                            dt.setData('text/plain', piece.textContent.trim());
+
+                            piece.dispatchEvent(new DragEvent('dragstart', {dataTransfer: dt, bubbles: true, cancelable: true}));
+                            slot.dispatchEvent(new DragEvent('dragenter', {dataTransfer: dt, bubbles: true, cancelable: true}));
+                            slot.dispatchEvent(new DragEvent('dragover', {dataTransfer: dt, bubbles: true, cancelable: true}));
+                            slot.dispatchEvent(new DragEvent('drop', {dataTransfer: dt, bubbles: true, cancelable: true}));
+                            piece.dispatchEvent(new DragEvent('dragend', {dataTransfer: dt, bubbles: true, cancelable: true}));
+                            filled++;
+                        } catch(e) {}
+                    }
+
+                    return {filled, pieces: pieces.length, slots: slots.length};
+                }
+            """)
+            print(f"    -> drag JS: {js_result}", flush=True)
+
+            # Check actual fill count from page (JS may over-report)
+            fill_count = await self.browser.page.evaluate("""
+                () => {
+                    const text = document.body.textContent || '';
+                    const match = text.match(/(\\d+)\\/(\\d+)\\s*filled/);
+                    return match ? parseInt(match[1]) : 0;
+                }
+            """)
+            print(f"    -> actual fill: {fill_count}/6", flush=True)
+            if fill_count >= 6:
+                await asyncio.sleep(0.5)
+                return True
+
+            # Step 3: Playwright mouse drag for remaining empty slots
+            # Use JS to get positions of unplaced pieces and empty slots
+            for drag_round in range(6):
+                state = await self.browser.page.evaluate("""
+                    () => {
+                        const text = document.body.textContent || '';
+                        const match = text.match(/(\\d+)\\/(\\d+)\\s*filled/);
+                        const filled = match ? parseInt(match[1]) : 0;
+                        if (filled >= 6) return {filled, done: true};
+
+                        // Find empty slots (still show "Slot N" text)
+                        const emptySlots = [...document.querySelectorAll('div')].filter(el => {
+                            const t = (el.textContent || '').trim();
+                            return t.match(/^Slot \\d+$/) &&
+                                   (el.className.includes('dashed') || (el.getAttribute('style') || '').includes('dashed'));
+                        }).map(el => {
+                            const rect = el.getBoundingClientRect();
+                            return {x: rect.x + rect.width/2, y: rect.y + rect.height/2};
+                        });
+
+                        // Find available pieces NOT inside drop zones
+                        // Pieces in the "available" area are above the drop zone area
+                        const dropZones = [...document.querySelectorAll('[class*="border-dashed"]')];
+                        const dropZoneSet = new Set(dropZones);
+                        const pieces = [...document.querySelectorAll('[draggable="true"]')].filter(el => {
+                            // Skip if this piece is inside a drop zone
+                            let parent = el.parentElement;
+                            while (parent) {
+                                if (dropZoneSet.has(parent)) return false;
+                                parent = parent.parentElement;
+                            }
+                            return el.offsetParent !== null;
+                        }).map(el => {
+                            const rect = el.getBoundingClientRect();
+                            return {x: rect.x + rect.width/2, y: rect.y + rect.height/2, text: el.textContent.trim()};
+                        });
+
+                        return {filled, done: false, emptySlots, pieces: pieces.slice(0, 6)};
+                    }
+                """)
+
+                if state.get('done') or state.get('filled', 0) >= 6:
+                    print(f"    -> all slots filled!", flush=True)
+                    return True
+
+                empty_slots = state.get('emptySlots', [])
+                avail_pieces = state.get('pieces', [])
+                if not empty_slots or not avail_pieces:
+                    print(f"    -> no empty slots ({len(empty_slots)}) or pieces ({len(avail_pieces)})", flush=True)
+                    break
+
+                # Drag first available piece to first empty slot
+                piece = avail_pieces[0]
+                slot = empty_slots[0]
+                try:
+                    await self.browser.page.mouse.move(piece['x'], piece['y'])
+                    await self.browser.page.mouse.down()
+                    await asyncio.sleep(0.05)
+                    await self.browser.page.mouse.move(slot['x'], slot['y'], steps=15)
+                    await asyncio.sleep(0.05)
+                    await self.browser.page.mouse.up()
+                    print(f"    -> dragged '{piece['text']}' to empty slot (round {drag_round+1})", flush=True)
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    print(f"    -> drag round {drag_round+1} failed: {e}", flush=True)
+
+            # Final count check
+            final = await self.browser.page.evaluate("""
+                () => {
+                    const text = document.body.textContent || '';
+                    const match = text.match(/(\\d+)\\/(\\d+)\\s*filled/);
+                    return match ? parseInt(match[1]) : 0;
+                }
+            """)
+            print(f"    -> final fill: {final}/6", flush=True)
+            return final > 0
+
+        except Exception as e:
+            print(f"    -> drag-and-drop error: {e}", flush=True)
+            return False
+
+    async def _brute_force_click(self) -> dict:
+        """Click buttons aggressively - no penalty for wrong clicks. Returns what was clicked."""
+        return await self.browser.page.evaluate("""
+            () => {
+                const result = {accept: 0, red: 0, gray: 0, submit: 0, reveal: 0};
+                const clicked = new Set();
+
+                // Click Accept buttons first
+                document.querySelectorAll('button').forEach(btn => {
+                    if (btn.textContent.includes('Accept') && btn.offsetParent) {
+                        btn.click();
+                        clicked.add(btn);
+                        result.accept++;
+                    }
+                });
+
+                // Click "Reveal Code" or similar buttons EARLY
+                document.querySelectorAll('button').forEach(btn => {
+                    const text = btn.textContent.toLowerCase();
+                    if ((text.includes('reveal') || text.includes('show') || text.includes('unlock')) && btn.offsetParent && !clicked.has(btn)) {
+                        btn.click();
+                        clicked.add(btn);
+                        result.reveal++;
+                    }
+                });
+
+                // Click ALL X-like buttons (red, gray, any close button)
+                document.querySelectorAll('button').forEach(btn => {
+                    if (btn.offsetParent && !clicked.has(btn)) {
+                        const style = getComputedStyle(btn);
+                        const bg = style.backgroundColor;
+                        const text = btn.textContent.trim();
+
+                        // Check for X symbol
+                        if (text === '×' || text === 'X' || text === '✕') {
+                            btn.click();
+                            clicked.add(btn);
+                            result.gray++;
+                            return;
+                        }
+
+                        // Check for red/pink background
+                        const match = bg.match(/rgb\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+                        if (match) {
+                            const [_, r, g, b] = match.map(Number);
+                            // Red buttons
+                            if (r > 180 && g < 100 && b < 100) {
+                                btn.click();
+                                clicked.add(btn);
+                                result.red++;
+                            }
+                            // Gray buttons (close buttons often gray)
+                            else if (r > 100 && r < 180 && g > 100 && g < 180 && b > 100 && b < 180) {
+                                btn.click();
+                                clicked.add(btn);
+                                result.gray++;
+                            }
+                        }
+                    }
+                });
+
+                // Click Submit buttons
+                document.querySelectorAll('button').forEach(btn => {
+                    if (btn.textContent.includes('Submit') && btn.offsetParent && !clicked.has(btn)) {
+                        btn.click();
+                        result.submit++;
+                    }
+                });
+
+                return result;
+            }
+        """)
+
+
+    async def _try_radio_selection(self) -> bool:
+        """Try to select correct radio option using Playwright native clicks.
+        Multiple options may SOUND correct but only one actually works.
+        Try each, submit, check URL - if wrong, try next option."""
+        try:
+            # First, scroll modal to TOP so radio options are visible
+            await self.browser.page.evaluate("""
+                () => {
+                    document.querySelectorAll('[class*="overflow-y"], [class*="overflow-auto"]').forEach(el => {
+                        if (el.scrollHeight > el.clientHeight) {
+                            el.scrollTop = 0;
+                        }
+                    });
+                }
+            """)
+            await asyncio.sleep(0.3)
+
+            url_before = await self.browser.get_url()
+
+            # Try each pattern - multiple may exist but only one is correct
+            patterns = [
+                'Correct answer', 'correct answer',
+                'This is correct', 'this is correct',
+                'The right choice', 'the right choice',
+                'Correct Choice', 'correct choice',
+                'Right answer', 'right answer',
+            ]
+            any_clicked = False
+            for pattern in patterns:
+                try:
+                    locator = self.browser.page.get_by_text(pattern, exact=False)
+                    count = await locator.count()
+                    if count > 0:
+                        await locator.first.click(timeout=1000)
+                        print(f"    -> Playwright clicked option: '{pattern}'", flush=True)
+                        any_clicked = True
+                        await asyncio.sleep(0.3)
+
+                        # Click Submit & Continue
+                        submitted = False
+                        try:
+                            submit = self.browser.page.get_by_text('Submit & Continue')
+                            if await submit.count() > 0:
+                                await submit.first.click(timeout=1000)
+                                submitted = True
+                            else:
+                                submit = self.browser.page.get_by_text('Submit and Continue')
+                                if await submit.count() > 0:
+                                    await submit.first.click(timeout=1000)
+                                    submitted = True
+                        except Exception:
+                            pass
+
+                        if submitted:
+                            print(f"    -> Clicked Submit & Continue", flush=True)
+                            await asyncio.sleep(0.5)
+                            url_after = await self.browser.get_url()
+                            if url_after != url_before:
+                                print(f"    -> Option '{pattern}' was correct!", flush=True)
+                                return True
+                            print(f"    -> '{pattern}' was wrong, trying next", flush=True)
+                except Exception:
+                    continue
+
+            return any_clicked
+        except Exception as e:
+            print(f"    -> radio selection error: {e}", flush=True)
+            return False
 
     def _check_progress(self, url: str, challenge_num: int) -> bool:
         """Check if we've progressed past current challenge."""
@@ -149,28 +1317,94 @@ class ChallengeSolver:
         return False
 
     async def _try_fill_code(self, codes: list[str]) -> bool:
-        """Try to fill code into input field."""
+        """Try to fill each code into input field. Returns True if any code was submitted."""
+        url_before = await self.browser.get_url()
+        any_submitted = False
+
         for code in codes:
             try:
-                # Try common input selectors
-                selectors = [
-                    "input[type='text']",
-                    "input[placeholder*='code' i]",
-                    "input[placeholder*='Code']",
-                    "input[name*='code' i]",
-                    "input:not([type='hidden'])",
-                ]
-                for sel in selectors:
-                    if await self.browser.type_text(sel, code):
-                        print(f"  Filled code: {code}")
-                        # Try to submit
-                        submit_clicked = await self.browser.click_by_text("Submit")
-                        if not submit_clicked:
-                            await self.browser.click_by_text("Next")
-                        return True
+                # Focus input and clear it first
+                has_input = await self.browser.page.evaluate("""
+                    () => {
+                        const input = document.querySelector('input[placeholder*="code"], input[type="text"]');
+                        if (input) {
+                            input.focus();
+                            input.value = '';
+                            return true;
+                        }
+                        return false;
+                    }
+                """)
+                if not has_input:
+                    print(f"    -> no input field found", flush=True)
+                    return False
+
+                # Type character by character - this properly triggers React state updates
+                await self.browser.page.keyboard.type(code, delay=30)
+                print(f"    -> typed '{code}'", flush=True)
+
+                # Wait for React to update
+                await asyncio.sleep(0.2)
+
+                # Click submit button via JS (to bypass any blocking popups)
+                clicked = await self.browser.page.evaluate("""
+                    () => {
+                        let btn = document.querySelector('button[type="submit"]');
+                        if (!btn) {
+                            const btns = document.querySelectorAll('button');
+                            for (const b of btns) {
+                                if (b.textContent.includes('Submit') && !b.disabled) {
+                                    btn = b;
+                                    break;
+                                }
+                            }
+                        }
+                        if (btn && !btn.disabled) {
+                            btn.click();
+                            return true;
+                        }
+                        return false;
+                    }
+                """)
+                if clicked:
+                    print(f"    -> clicked Submit", flush=True)
+                else:
+                    await self.browser.page.keyboard.press('Enter')
+                    print(f"    -> pressed Enter", flush=True)
+
+                any_submitted = True
+
+                # Check if URL changed (code was correct)
+                await asyncio.sleep(0.5)
+                url_after = await self.browser.get_url()
+                if url_after != url_before:
+                    print(f"    -> URL changed! Code {code} worked", flush=True)
+                    return True
+
+                # Code was wrong, try the next one
+                print(f"    -> code {code} didn't work, trying next", flush=True)
+            except Exception as e:
+                print(f"    -> fill error: {e}", flush=True)
+
+        return any_submitted
+
+    async def _close_blocking_popups(self) -> None:
+        """Close any popups that might be blocking interactions."""
+        # Try to close popups with X button (not Dismiss which is fake)
+        close_selectors = [
+            "button:has-text('×')",
+            "button:has-text('✕')",
+            "button:has-text('X'):not(:has-text('Dismiss'))",
+            "[aria-label*='close' i]",
+            ".close-button",
+            "button:has(svg)",  # Often X buttons use SVG icons
+        ]
+        for sel in close_selectors:
+            try:
+                await self.browser.page.click(sel, timeout=300)
+                await asyncio.sleep(0.1)
             except Exception:
                 continue
-        return False
 
     async def _execute_action(self, action) -> None:
         """Execute the determined action."""
@@ -199,6 +1433,16 @@ class ChallengeSolver:
         elif action.action_type == ActionType.NAVIGATE:
             if action.target_selector:
                 await self.browser.click(action.target_selector)
+
+        elif action.action_type == ActionType.HOVER:
+            if action.target_selector:
+                try:
+                    el = self.browser.page.locator(action.target_selector)
+                    if await el.count() > 0:
+                        await el.first.hover(timeout=2000)
+                        await asyncio.sleep(1.5)
+                except Exception:
+                    pass
 
         elif action.action_type == ActionType.EXTRACT_CODE:
             # Code extraction handled in main loop

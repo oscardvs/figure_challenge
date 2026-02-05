@@ -5,22 +5,26 @@ import sys
 from datetime import datetime
 from dotenv import load_dotenv
 
+# Force unbuffered output
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 from solver import ChallengeSolver
 from config import GEMINI_API_KEY, CHALLENGE_URL, MAX_TIME_SECONDS
 
 
 async def main(headless: bool = False):
     if not GEMINI_API_KEY:
-        print("ERROR: Set GEMINI_API_KEY environment variable")
-        print("  export GEMINI_API_KEY=your-api-key")
-        print("  or create a .env file with GEMINI_API_KEY=your-api-key")
+        print("ERROR: Set GEMINI_API_KEY environment variable", flush=True)
+        print("  export GEMINI_API_KEY=your-api-key", flush=True)
+        print("  or create a .env file with GEMINI_API_KEY=your-api-key", flush=True)
         sys.exit(1)
 
-    print(f"Starting Browser Challenge Agent")
-    print(f"Target: {CHALLENGE_URL}")
-    print(f"Time limit: {MAX_TIME_SECONDS}s")
-    print(f"Headless: {headless}")
-    print("-" * 50)
+    print(f"Starting Browser Challenge Agent", flush=True)
+    print(f"Target: {CHALLENGE_URL}", flush=True)
+    print(f"Time limit: {MAX_TIME_SECONDS}s", flush=True)
+    print(f"Headless: {headless}", flush=True)
+    print("-" * 50, flush=True)
 
     solver = ChallengeSolver(GEMINI_API_KEY)
 

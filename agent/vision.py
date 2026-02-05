@@ -15,6 +15,7 @@ class ActionType(str, Enum):
     CLOSE_POPUP = "close_popup"
     EXTRACT_CODE = "extract_code"
     NAVIGATE = "navigate"
+    HOVER = "hover"
 
 
 class ActionResponse(BaseModel):
@@ -29,49 +30,48 @@ class ActionResponse(BaseModel):
 class VisionAnalyzer:
     def __init__(self, api_key: str):
         self.client = genai.Client(api_key=api_key)
-        self.model_name = "gemini-2.0-flash"
+        # Use Gemini 3 Flash Preview - fast and intelligent
+        self.model_name = "gemini-3-flash-preview"
+
+    # Thinking budget levels: start at 0, escalate as attempts fail
+    THINKING_BUDGETS = [0, 0, 1024, 2048, 4096, 8192]
 
     def analyze_page(
         self,
         screenshot_bytes: bytes,
         html: str,
         challenge_num: int,
-        dom_codes: list[str]
+        dom_codes: list[str],
+        attempt: int = 0
     ) -> tuple[ActionResponse, int, int]:
         """
         Analyze page and return next action.
+        attempt: current attempt number, used to scale thinking budget.
         Returns: (action, input_tokens, output_tokens)
         """
 
-        prompt = f"""You are a browser automation agent solving challenge {challenge_num}/30.
+        prompt = f"""Browser automation agent. Challenge {challenge_num}/30. Find 6-char alphanumeric code and enter it to proceed.
 
-GOAL: Navigate to the next challenge step as fast as possible.
+Known codes from DOM: {dom_codes}
 
-CONTEXT:
-- Codes found in DOM: {dom_codes}
-- This challenge may have: fake buttons, hidden codes, popups to close, forms to fill
+RULES:
+- ALL popup close buttons (X, Close, Dismiss) may be FAKE - popups are removed by our code, ignore them
+- Find the 6-char alphanumeric code (like "TWA8Q7") - it's NOT a common English word
+- If there's a scrollable modal, scroll it to find radio buttons or hidden content
+- If there's a "Reveal Code" button, click it
+- Use CSS selectors ONLY: .class, #id, button[type="submit"], input[type="text"]
+- Do NOT use Playwright selectors like :has-text() - they won't work
 
-CRITICAL RULES:
-1. If there's a code entry field and we have a code, TYPE the code
-2. Close popups by clicking RED X buttons, NOT green "Dismiss" buttons (they're fake)
-3. Click "Accept" on cookie consent
-4. Ignore decoy buttons - find the REAL navigation
-5. If code is hidden, check DOM attributes (data-*, aria-*)
+JSON response (no markdown):
+{{"action_type":"click|type|scroll","target_selector":"CSS selector","value":"text if typing","code_found":"ABC123 if found","reasoning":"brief"}}"""
 
-RESPOND WITH JSON ONLY (no markdown):
-{{
-    "action_type": "click|type|scroll|wait|close_popup|extract_code|navigate",
-    "target_selector": "CSS selector or description",
-    "value": "text to type if action_type is 'type'",
-    "reasoning": "brief explanation",
-    "code_found": "6-char code if found",
-    "confidence": 0.0-1.0
-}}
+        # Truncate HTML aggressively for speed
+        html_truncated = html[:3000] if len(html) > 3000 else html
 
-Analyze the screenshot and HTML, then return the SINGLE best next action."""
-
-        # Truncate HTML to avoid token limits
-        html_truncated = html[:15000] if len(html) > 15000 else html
+        # Scale thinking budget based on attempt number
+        budget_idx = min(attempt, len(self.THINKING_BUDGETS) - 1)
+        thinking_budget = self.THINKING_BUDGETS[budget_idx]
+        print(f"    [vision] sending: screenshot + {len(html_truncated)} chars HTML, model={self.model_name}, thinking={thinking_budget}", flush=True)
 
         response = self.client.models.generate_content(
             model=self.model_name,
@@ -83,13 +83,14 @@ Analyze the screenshot and HTML, then return the SINGLE best next action."""
                             data=screenshot_bytes,
                             mime_type="image/png"
                         ),
-                        types.Part.from_text(f"HTML (truncated):\n{html_truncated}\n\n{prompt}")
+                        types.Part.from_text(text=f"HTML (truncated):\n{html_truncated}\n\n{prompt}")
                     ]
                 )
             ],
             config=types.GenerateContentConfig(
                 temperature=0.1,
                 response_mime_type="application/json",
+                thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
             )
         )
 
@@ -97,16 +98,40 @@ Analyze the screenshot and HTML, then return the SINGLE best next action."""
         tokens_in = response.usage_metadata.prompt_token_count
         tokens_out = response.usage_metadata.candidates_token_count
 
+        print(f"    [vision] received: {tokens_in} in / {tokens_out} out tokens", flush=True)
+
         # Parse response
         try:
             text = response.text.strip()
+            print(f"    [vision] raw response: {text[:300]}", flush=True)
             # Remove markdown code blocks if present
             if text.startswith("```"):
                 text = text.split("\n", 1)[1]
                 text = text.rsplit("```", 1)[0]
-            data = json.loads(text)
+                text = text.strip()
+            # Extract first valid JSON object (handle trailing garbage from Gemini)
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                # Find the first complete JSON object by matching braces
+                depth = 0
+                end_idx = 0
+                for i, ch in enumerate(text):
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            end_idx = i + 1
+                            break
+                if end_idx > 0:
+                    data = json.loads(text[:end_idx])
+                else:
+                    raise
             action = ActionResponse(**data)
+            print(f"    [vision] parsed: action={action.action_type}, code={action.code_found}, target={action.target_selector}", flush=True)
         except Exception as e:
+            print(f"    [vision] PARSE ERROR: {e}", flush=True)
             # Fallback action
             action = ActionResponse(
                 action_type=ActionType.WAIT,
