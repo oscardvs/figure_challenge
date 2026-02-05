@@ -1,4 +1,5 @@
 import re
+import base64
 from bs4 import BeautifulSoup, Comment
 
 # Pattern for 6-character alphanumeric codes
@@ -96,6 +97,27 @@ def extract_hidden_codes(html: str) -> list[str]:
         title = elem.get('title', '')
         if isinstance(title, str):
             codes.update(CODE_PATTERN.findall(title.upper()))
+
+    # 7. Decode Base64 strings in the page (may contain hidden codes)
+    b64_pattern = re.compile(r'[A-Za-z0-9+/]{8,}={0,2}')
+    all_text = soup.get_text(separator=' ') + ' ' + html
+    for b64_match in b64_pattern.findall(all_text):
+        try:
+            decoded = base64.b64decode(b64_match).decode('utf-8', errors='ignore')
+            if decoded:
+                codes.update(CODE_PATTERN.findall(decoded.upper()))
+        except Exception:
+            pass
+    # Also check data attributes for base64
+    for elem in soup.find_all(True):
+        for key, value in elem.attrs.items():
+            if key.startswith('data-') and isinstance(value, str) and len(value) >= 8:
+                try:
+                    decoded = base64.b64decode(value).decode('utf-8', errors='ignore')
+                    if decoded:
+                        codes.update(CODE_PATTERN.findall(decoded.upper()))
+                except Exception:
+                    pass
 
     # Filter out false positives
     codes = {c for c in codes if c not in FALSE_POSITIVES}

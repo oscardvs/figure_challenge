@@ -34,7 +34,7 @@ class VisionAnalyzer:
         self.model_name = "gemini-3-flash-preview"
 
     # Thinking budget levels: start at 0, escalate as attempts fail
-    THINKING_BUDGETS = [0, 0, 1024, 2048, 4096, 8192]
+    THINKING_BUDGETS = [1024, 2048, 4096, 8192, 8192, 8192]
 
     def analyze_page(
         self,

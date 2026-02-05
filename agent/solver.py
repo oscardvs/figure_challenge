@@ -1,5 +1,6 @@
 import asyncio
 import re
+import time
 from browser import BrowserController
 from vision import VisionAnalyzer, ActionType
 from dom_parser import extract_hidden_codes
@@ -22,7 +23,7 @@ class ChallengeSolver:
         self.metrics = MetricsTracker()
         self.max_attempts_per_challenge = 10
         self.current_challenge = 0
-        self.used_codes: set[str] = set()  # Track codes that already worked on previous steps
+        self.failed_codes_this_step: set[str] = set()  # Track codes that failed on current step
 
     async def run(self, start_url: str, headless: bool = False) -> dict:
         """Run through all 30 challenges."""
@@ -41,20 +42,26 @@ class ChallengeSolver:
             print(f"START clicked: {start_clicked}")
             await asyncio.sleep(1)
 
+            run_start = time.time()
             for challenge_num in range(1, 31):
                 self.current_challenge = challenge_num
                 self.metrics.start_challenge(challenge_num)
-                print(f"\n--- Challenge {challenge_num}/30 ---")
+                challenge_start = time.time()
+                elapsed_total = challenge_start - run_start
+                print(f"\n--- Challenge {challenge_num}/30 (elapsed: {elapsed_total:.1f}s) ---")
 
                 success = await self._solve_challenge(challenge_num)
 
-                if not success:
+                challenge_time = time.time() - challenge_start
+                if success:
+                    print(f"  [{challenge_time:.1f}s] Challenge {challenge_num} PASSED", flush=True)
+                else:
                     self.metrics.end_challenge(
                         challenge_num,
                         success=False,
                         error="Failed to solve within max attempts"
                     )
-                    print(f"Challenge {challenge_num} FAILED")
+                    print(f"  [{challenge_time:.1f}s] Challenge {challenge_num} FAILED", flush=True)
 
         finally:
             await self.browser.stop()
@@ -80,6 +87,9 @@ class ChallengeSolver:
         """Solve challenge using brute-force + DOM parsing (fast, no vision)."""
         total_tokens_in = 0
         total_tokens_out = 0
+
+        # Reset per-step tracking
+        self.failed_codes_this_step = set()
 
         # Wait for React to render the page content
         content_loaded = await self._wait_for_content()
@@ -429,11 +439,11 @@ class ChallengeSolver:
             if dom_codes:
                 print(f"  dom_codes: {dom_codes}", flush=True)
 
-                # Stale code recovery: if ALL codes were used on previous steps,
-                # the React SPA retained old component state. Reset via back/forward.
-                all_stale = all(c in self.used_codes for c in dom_codes)
-                if all_stale and not stale_recovery_done:
-                    print(f"  -> all {len(dom_codes)} codes stale, resetting React state...", flush=True)
+                # Stale code recovery: if ALL codes were tried and failed on this step,
+                # the React SPA may have retained old component state. Reset via back/forward.
+                all_failed = all(c in self.failed_codes_this_step for c in dom_codes)
+                if all_failed and not stale_recovery_done and len(self.failed_codes_this_step) > 0:
+                    print(f"  -> all {len(dom_codes)} codes failed this step, resetting React state...", flush=True)
                     stale_recovery_done = True
                     try:
                         await self.browser.page.go_back(wait_until='domcontentloaded', timeout=2000)
@@ -454,9 +464,10 @@ class ChallengeSolver:
                     await asyncio.sleep(1)
                     continue
 
-            # Use vision every 5th attempt as fallback, with escalating thinking
-            vision_call_num = attempt // 5  # 0th, 1st, 2nd... vision call
-            if attempt > 0 and attempt % 5 == 0:
+            # Use AI vision agent earlier and more aggressively when stuck
+            # Trigger at attempt 3, then every 3 attempts (3, 6, 9, 12...)
+            if attempt >= 3 and attempt % 3 == 0:
+                vision_call_num = (attempt - 3) // 3
                 print(f"  vision (call #{vision_call_num})...", flush=True)
                 screenshot = await self.browser.screenshot()
                 action, tin, tout = self.vision.analyze_page(
@@ -666,6 +677,16 @@ class ChallengeSolver:
                     }
                 });
 
+                // 3b. Click "I Remember" button (Memory Challenge - reveals timing/capture)
+                document.querySelectorAll('button').forEach(btn => {
+                    const text = (btn.textContent || '').trim().toLowerCase();
+                    if (text.includes('i remember') && btn.offsetParent && !btn.disabled) {
+                        btn.click();
+                        result.reveal_clicked++;
+                        result.handled = true;
+                    }
+                });
+
                 // 4. Remove blocking overlays (bg-black/70) - disable pointer events
                 document.querySelectorAll('.fixed').forEach(el => {
                     if (el.classList.contains('bg-black/70') ||
@@ -776,34 +797,70 @@ class ChallengeSolver:
             """)
             await asyncio.sleep(0.3)
 
-            # Step 2: Find the hover target element and scroll it into view
+            # Step 2: Find hover target, prefer innermost child, dispatch React events
             target_info = await self.browser.page.evaluate("""
                 () => {
-                    // Strategy 1: cursor-pointer element inside hover section
+                    // Remove old markers
+                    document.querySelectorAll('[data-hover-target]').forEach(el => el.removeAttribute('data-hover-target'));
+
+                    let best = null;
+
+                    // Strategy 1: cursor-pointer elements - find innermost interactive child
                     const cursorEls = [...document.querySelectorAll('[class*="cursor-pointer"]')].filter(el => {
                         return el.offsetParent && el.offsetWidth > 50 && el.offsetHeight > 30;
                     });
-                    // Strategy 2: bordered box element
-                    const borderEls = [...document.querySelectorAll('div')].filter(el => {
-                        const cls = el.className || '';
-                        return cls.includes('border-2') && cls.includes('rounded') &&
-                               el.offsetParent && el.offsetWidth > 50;
-                    });
-                    // Strategy 3: min-h element with border
-                    const minHEls = [...document.querySelectorAll('div')].filter(el => {
-                        const cls = el.className || '';
-                        return cls.includes('min-h-') && cls.includes('border') &&
-                               el.offsetParent && el.offsetWidth > 50;
-                    });
-
-                    const candidates = [...cursorEls, ...borderEls, ...minHEls];
-                    if (candidates.length > 0) {
-                        const el = candidates[0];
-                        el.scrollIntoView({behavior: 'instant', block: 'center'});
-                        const rect = el.getBoundingClientRect();
-                        return {x: rect.x + rect.width/2, y: rect.y + rect.height/2, found: true};
+                    for (const parent of cursorEls) {
+                        // Prefer inner child with bg/border/padding classes (React event target)
+                        const children = parent.querySelectorAll('div');
+                        for (const child of children) {
+                            const cls = child.className || '';
+                            if (child.offsetWidth > 30 && child.offsetHeight > 20 &&
+                                child.offsetParent &&
+                                (cls.includes('bg-') || cls.includes('border') || cls.includes('p-'))) {
+                                best = child;
+                                break;
+                            }
+                        }
+                        if (!best) best = parent;
+                        break;
                     }
-                    return {found: false};
+
+                    // Strategy 2: bordered box element (fallback)
+                    if (!best) {
+                        const borderEls = [...document.querySelectorAll('div')].filter(el => {
+                            const cls = el.className || '';
+                            return cls.includes('border-2') && cls.includes('rounded') &&
+                                   el.offsetParent && el.offsetWidth > 50;
+                        });
+                        if (borderEls.length > 0) best = borderEls[0];
+                    }
+
+                    // Strategy 3: min-h element with border (fallback)
+                    if (!best) {
+                        const minHEls = [...document.querySelectorAll('div')].filter(el => {
+                            const cls = el.className || '';
+                            return cls.includes('min-h-') && cls.includes('border') &&
+                                   el.offsetParent && el.offsetWidth > 50;
+                        });
+                        if (minHEls.length > 0) best = minHEls[0];
+                    }
+
+                    if (!best) return {found: false};
+
+                    // Mark for Playwright locator
+                    best.setAttribute('data-hover-target', 'true');
+                    best.scrollIntoView({behavior: 'instant', block: 'center'});
+
+                    // Dispatch mouse events directly (React needs mouseenter/mouseover)
+                    const rect = best.getBoundingClientRect();
+                    const cx = rect.x + rect.width / 2;
+                    const cy = rect.y + rect.height / 2;
+                    const opts = {bubbles: true, cancelable: true, clientX: cx, clientY: cy};
+                    best.dispatchEvent(new MouseEvent('mouseenter', opts));
+                    best.dispatchEvent(new MouseEvent('mouseover', opts));
+                    best.dispatchEvent(new MouseEvent('mousemove', opts));
+
+                    return {x: cx, y: cy, found: true};
                 }
             """)
 
@@ -812,12 +869,27 @@ class ChallengeSolver:
 
             await asyncio.sleep(0.3)
 
-            # Step 3: Hover using mouse.move for precise control
+            # Step 3: Use Playwright .hover() for full event chain (mouseenter+mouseover+mousemove)
             x, y = target_info['x'], target_info['y']
-            await self.browser.page.mouse.move(x, y)
+            try:
+                el = self.browser.page.locator('[data-hover-target="true"]')
+                if await el.count() > 0:
+                    await el.first.hover(timeout=2000)
+            except Exception:
+                # Fallback to mouse.move
+                await self.browser.page.mouse.move(x, y)
+
             print(f"    -> hovering at ({x:.0f}, {y:.0f})", flush=True)
             # Hold hover for 2 seconds (challenge typically requires 1s)
             await asyncio.sleep(2.0)
+
+            # Clean up marker
+            try:
+                await self.browser.page.evaluate(
+                    "document.querySelector('[data-hover-target]')?.removeAttribute('data-hover-target')"
+                )
+            except Exception:
+                pass
 
             return True
         except Exception as e:
@@ -1159,12 +1231,19 @@ class ChallengeSolver:
                 """)
                 if clicked:
                     print(f"    -> clicked Capture", flush=True)
+                    no_btn_count = 0
                 else:
-                    print(f"    -> no Capture button found", flush=True)
+                    no_btn_count = getattr(self, '_rotate_no_btn', 0) + 1
+                    self._rotate_no_btn = no_btn_count
+                    print(f"    -> no Capture button found ({no_btn_count})", flush=True)
+                    if no_btn_count >= 3:
+                        print(f"    -> Capture gone, stopping early", flush=True)
+                        return True
 
                 # Wait for next rotation cycle (code changes every 3 seconds)
                 await asyncio.sleep(1.0)
 
+            self._rotate_no_btn = 0
             return True
         except Exception as e:
             print(f"    -> rotating code error: {e}", flush=True)
@@ -1320,43 +1399,103 @@ class ChallengeSolver:
             hover_done = await self.browser.page.evaluate("""
                 () => {
                     const els = [...document.querySelectorAll('div, span, p')];
+                    // Prefer the most specific element (fewest children)
+                    let best = null;
                     for (const el of els) {
                         const t = (el.textContent || '').trim().toLowerCase();
-                        if (t.includes('hover over') && el.offsetParent) {
-                            el.scrollIntoView({behavior: 'instant', block: 'center'});
-                            const rect = el.getBoundingClientRect();
-                            return {found: true, x: rect.x + rect.width/2, y: rect.y + rect.height/2};
+                        if ((t === 'hover over this area' || t.includes('hover over')) &&
+                            el.offsetParent) {
+                            if (!best || el.textContent.length < best.textContent.length) {
+                                best = el;
+                            }
                         }
+                    }
+                    if (best) {
+                        best.scrollIntoView({behavior: 'instant', block: 'center'});
+                        const rect = best.getBoundingClientRect();
+                        return {found: true, x: rect.x + rect.width/2, y: rect.y + rect.height/2};
                     }
                     return {found: false};
                 }
             """)
             if hover_done.get('found'):
                 await self.browser.page.mouse.move(hover_done['x'], hover_done['y'])
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.5)
+                # Also dispatch mouseenter/mouseover events for React
+                await self.browser.page.evaluate(f"""
+                    () => {{
+                        const el = document.elementFromPoint({hover_done['x']}, {hover_done['y']});
+                        if (el) {{
+                            el.dispatchEvent(new MouseEvent('mouseenter', {{bubbles: true, clientX: {hover_done['x']}, clientY: {hover_done['y']}}}));
+                            el.dispatchEvent(new MouseEvent('mouseover', {{bubbles: true, clientX: {hover_done['x']}, clientY: {hover_done['y']}}}));
+                        }}
+                    }}
+                """)
+                await asyncio.sleep(0.8)
                 print(f"    -> hovered over area", flush=True)
 
             # Action 3: Type text in the input field
-            type_done = await self.browser.page.evaluate("""
-                () => {
-                    const inputs = document.querySelectorAll('input[type="text"], input:not([type])');
-                    for (const inp of inputs) {
-                        const ph = (inp.placeholder || '').toLowerCase();
-                        if ((ph.includes('type') || ph.includes('click')) && inp.offsetParent) {
-                            inp.scrollIntoView({behavior: 'instant', block: 'center'});
-                            const rect = inp.getBoundingClientRect();
-                            return {found: true, x: rect.x + rect.width/2, y: rect.y + rect.height/2};
-                        }
+            # Use multiple strategies to find and fill the sequence's text input
+            type_done = False
+            # Strategy A: Use Playwright locator to find non-code text inputs
+            try:
+                # Find inputs that are NOT the code submission input
+                all_inputs = self.browser.page.locator(
+                    'input[type="text"], input:not([type]):not([placeholder*="code" i]):not([placeholder*="Code"])'
+                )
+                count = await all_inputs.count()
+                for i in range(count):
+                    inp = all_inputs.nth(i)
+                    if await inp.is_visible():
+                        placeholder = await inp.get_attribute('placeholder') or ''
+                        if 'code' in placeholder.lower():
+                            continue
+                        # Found a visible non-code text input - use fill() for React
+                        await inp.scroll_into_view_if_needed()
+                        await inp.click(timeout=1000)
+                        await inp.fill("hello world")
+                        # Also type a character to trigger keydown/keyup/input events
+                        await inp.press("Space")
+                        await asyncio.sleep(0.1)
+                        await inp.evaluate("""el => {
+                            const nativeSetter = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value').set;
+                            nativeSetter.call(el, el.value || 'hello world');
+                            el.dispatchEvent(new Event('input', {bubbles: true}));
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                        }""")
+                        type_done = True
+                        print(f"    -> typed text in input (Playwright fill)", flush=True)
+                        break
+            except Exception as e:
+                print(f"    -> type input Playwright error: {e}", flush=True)
+
+            if not type_done:
+                # Strategy B: JS-based input finding with nativeInputValueSetter
+                type_done = await self.browser.page.evaluate("""
+                    () => {
+                        const inputs = [...document.querySelectorAll('input[type="text"], input:not([type]), textarea')];
+                        const nonCodeInputs = inputs.filter(inp => {
+                            const ph = (inp.placeholder || '').toLowerCase();
+                            return !ph.includes('code') && !ph.includes('proceed') && inp.offsetParent &&
+                                   inp.type !== 'number' && inp.type !== 'hidden';
+                        });
+                        if (nonCodeInputs.length === 0) return false;
+                        const inp = nonCodeInputs[0];
+                        inp.scrollIntoView({behavior: 'instant', block: 'center'});
+                        inp.focus();
+                        const nativeSetter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value').set;
+                        nativeSetter.call(inp, 'hello world');
+                        inp.dispatchEvent(new Event('input', {bubbles: true}));
+                        inp.dispatchEvent(new Event('change', {bubbles: true}));
+                        inp.dispatchEvent(new Event('blur', {bubbles: true}));
+                        return true;
                     }
-                    return {found: false};
-                }
-            """)
-            if type_done.get('found'):
-                await self.browser.page.mouse.click(type_done['x'], type_done['y'])
-                await asyncio.sleep(0.2)
-                await self.browser.page.keyboard.type("hello", delay=50)
-                print(f"    -> typed text in input", flush=True)
-                await asyncio.sleep(0.3)
+                """)
+                if type_done:
+                    print(f"    -> typed text in input (JS nativeSetter)", flush=True)
+            await asyncio.sleep(0.3)
 
             # Action 4: Scroll inside the scroll box
             scroll_done = await self.browser.page.evaluate("""
@@ -2408,16 +2547,16 @@ class ChallengeSolver:
 
     async def _try_fill_code(self, codes: list[str]) -> bool:
         """Try to fill each code into input field. Returns True if any code was submitted."""
-        # Filter out codes that already worked on previous steps (stale SPA state)
-        fresh_codes = [c for c in codes if c not in self.used_codes]
-        if not fresh_codes and codes:
-            print(f"    -> all {len(codes)} codes are stale (used on previous steps), skipping", flush=True)
+        # Skip codes that already failed on THIS step (not previous steps - same code can be valid across steps)
+        untried = [c for c in codes if c not in self.failed_codes_this_step]
+        if not untried and codes:
+            print(f"    -> all {len(codes)} codes already tried this step, skipping", flush=True)
             return False
 
         url_before = await self.browser.get_url()
         any_submitted = False
 
-        for code in fresh_codes:
+        for code in untried:
             try:
                 # Scroll the code input into view via JS first
                 await self.browser.page.evaluate("""
@@ -2522,8 +2661,6 @@ class ChallengeSolver:
                     print(f"    -> pressed Enter", flush=True)
 
                 any_submitted = True
-                # Track submitted code so it's skipped on future steps (prevents stale SPA codes)
-                self.used_codes.add(code)
 
                 # Check if URL changed (code was correct)
                 await asyncio.sleep(0.5)
@@ -2532,7 +2669,8 @@ class ChallengeSolver:
                     print(f"    -> URL changed! Code {code} worked", flush=True)
                     return True
 
-                # Code was wrong, try the next one
+                # Code was wrong - track it so we don't retry it this step
+                self.failed_codes_this_step.add(code)
                 print(f"    -> code {code} didn't work, trying next", flush=True)
             except Exception as e:
                 print(f"    -> fill error: {e}", flush=True)
