@@ -15,6 +15,57 @@ class BrowserController:
         self.browser = await self.playwright.chromium.launch(headless=headless)
         self.page = await self.browser.new_page()
         await self.page.set_viewport_size({"width": 1280, "height": 800})
+
+        # Inject audio interception BEFORE page scripts run.
+        # This catches SpeechSynthesis, Audio(), and blob audio from auto-play.
+        await self.page.add_init_script("""
+            window.__capturedSpeechTexts = [];
+            window.__capturedSpeechUtterance = null;
+            window.__speechDone = false;
+            window.__capturedAudioSrc = null;
+            window.__capturedAudio = null;
+            window.__audioFullPatched = true;
+
+            // 1. SpeechSynthesis interception
+            if (window.speechSynthesis) {
+                const origSpeak = window.speechSynthesis.speak.bind(window.speechSynthesis);
+                window.speechSynthesis.speak = function(utterance) {
+                    window.__capturedSpeechTexts.push(utterance.text);
+                    window.__capturedSpeechUtterance = utterance;
+                    return origSpeak(utterance);
+                };
+            }
+
+            // 2. Audio constructor interception
+            const OrigAudio = window.Audio;
+            window.Audio = function(src) {
+                const audio = new OrigAudio(src);
+                window.__capturedAudioSrc = src || null;
+                window.__capturedAudio = audio;
+                return audio;
+            };
+            window.Audio.prototype = OrigAudio.prototype;
+
+            // 3. HTMLAudioElement.play interception
+            const origPlay = HTMLAudioElement.prototype.play;
+            HTMLAudioElement.prototype.play = function() {
+                window.__capturedAudioSrc = this.src || this.currentSrc;
+                window.__capturedAudio = this;
+                return origPlay.call(this);
+            };
+
+            // 4. URL.createObjectURL interception for blob audio
+            const origCreateObjUrl = URL.createObjectURL;
+            URL.createObjectURL = function(obj) {
+                const url = origCreateObjUrl.call(URL, obj);
+                if (obj instanceof Blob && (obj.type.includes('audio') || obj.type === '')) {
+                    window.__capturedBlobUrl = url;
+                    window.__capturedBlob = obj;
+                }
+                return url;
+            };
+        """)
+
         await self.page.goto(url)
 
     async def stop(self) -> None:

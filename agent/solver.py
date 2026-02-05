@@ -228,6 +228,27 @@ class ChallengeSolver:
                                 print(f"  >>> PASSED <<<", flush=True)
                                 return True
 
+            # Handle Timing Challenge (click Capture while window is active)
+            if 'timing' in html_lower and 'capture' in html_lower and 'active' in html_lower:
+                timing_result = await self._try_timing_challenge()
+                if timing_result:
+                    print(f"  timing_challenge: completed", flush=True)
+                    await asyncio.sleep(0.5)
+                    html = await self.browser.get_html()
+                    dom_codes = extract_hidden_codes(html)
+                    if dom_codes:
+                        print(f"  post-timing codes: {dom_codes}", flush=True)
+                        filled = await self._try_fill_code(dom_codes)
+                        if filled:
+                            url = await self.browser.get_url()
+                            if self._check_progress(url, challenge_num):
+                                self.metrics.end_challenge(
+                                    challenge_num, success=True,
+                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                )
+                                print(f"  >>> PASSED <<<", flush=True)
+                                return True
+
             # Handle Audio Challenge (play audio, click complete to reveal code)
             if 'audio' in html_lower and ('play' in html_lower or 'listen' in html_lower):
                 audio_result = await self._try_audio_challenge()
@@ -238,6 +259,48 @@ class ChallengeSolver:
                     dom_codes = extract_hidden_codes(html)
                     if dom_codes:
                         print(f"  post-audio codes: {dom_codes}", flush=True)
+                        filled = await self._try_fill_code(dom_codes)
+                        if filled:
+                            url = await self.browser.get_url()
+                            if self._check_progress(url, challenge_num):
+                                self.metrics.end_challenge(
+                                    challenge_num, success=True,
+                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                )
+                                print(f"  >>> PASSED <<<", flush=True)
+                                return True
+
+            # Handle Split Parts Challenge (click scattered parts to assemble code)
+            if 'split' in html_lower and 'part' in html_lower and ('found' in html_lower or 'click' in html_lower):
+                split_result = await self._try_split_parts_challenge()
+                if split_result:
+                    print(f"  split_parts: completed", flush=True)
+                    await asyncio.sleep(0.5)
+                    html = await self.browser.get_html()
+                    dom_codes = extract_hidden_codes(html)
+                    if dom_codes:
+                        print(f"  post-split codes: {dom_codes}", flush=True)
+                        filled = await self._try_fill_code(dom_codes)
+                        if filled:
+                            url = await self.browser.get_url()
+                            if self._check_progress(url, challenge_num):
+                                self.metrics.end_challenge(
+                                    challenge_num, success=True,
+                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                )
+                                print(f"  >>> PASSED <<<", flush=True)
+                                return True
+
+            # Handle Video Challenge (seek through frames to find code)
+            if 'video' in html_lower and 'frame' in html_lower and 'seek' in html_lower:
+                video_result = await self._try_video_challenge()
+                if video_result:
+                    print(f"  video_challenge: completed", flush=True)
+                    await asyncio.sleep(0.5)
+                    html = await self.browser.get_html()
+                    dom_codes = extract_hidden_codes(html)
+                    if dom_codes:
+                        print(f"  post-video codes: {dom_codes}", flush=True)
                         filled = await self._try_fill_code(dom_codes)
                         if filled:
                             url = await self.browser.get_url()
@@ -708,30 +771,177 @@ class ChallengeSolver:
             print(f"    -> canvas error: {e}", flush=True)
             return False
 
+    async def _try_split_parts_challenge(self) -> bool:
+        """Handle Split Parts Challenge - scroll to and click all scattered parts."""
+        try:
+            for click_round in range(10):
+                # Use JS to: find all parts, scroll each into view, click it
+                result = await self.browser.page.evaluate("""
+                    () => {
+                        const text = document.body.textContent || '';
+                        const foundMatch = text.match(/(\\d+)\\/(\\d+)\\s*found/);
+                        const found = foundMatch ? parseInt(foundMatch[1]) : 0;
+                        const total = foundMatch ? parseInt(foundMatch[2]) : 4;
+                        if (found >= total) return {found, total, clicked: 0, done: true};
+
+                        let clicked = 0;
+                        // Find ALL part divs and click unclicked ones
+                        document.querySelectorAll('div').forEach(el => {
+                            const style = getComputedStyle(el);
+                            const cls = el.className || '';
+                            const elText = (el.textContent || '').trim();
+                            if (!(style.position === 'absolute' || cls.includes('absolute'))) return;
+                            if (!elText.match(/Part\\s*\\d/i)) return;
+                            if (el.offsetWidth < 10) return;
+
+                            // Skip already-clicked (green background)
+                            const bg = style.backgroundColor;
+                            const isGreen = bg.includes('134') || bg.includes('green') ||
+                                cls.includes('bg-green');
+                            if (isGreen) return;
+
+                            // Scroll into view and click
+                            el.scrollIntoView({behavior: 'instant', block: 'center'});
+                            el.click();
+                            clicked++;
+                        });
+
+                        return {found, total, clicked, done: false};
+                    }
+                """)
+                print(f"    -> split: {result.get('found')}/{result.get('total')} found, "
+                      f"clicked {result.get('clicked')} this round", flush=True)
+
+                if result.get('done'):
+                    print(f"    -> all parts collected!", flush=True)
+                    break
+
+                if result.get('clicked', 0) == 0:
+                    # No unclicked parts found via JS - scroll down to reveal more
+                    await self.browser.page.evaluate(
+                        "() => window.scrollBy(0, 400)"
+                    )
+                await asyncio.sleep(0.5)
+
+            # Read the assembled code from parts
+            await asyncio.sleep(0.5)
+            assembled = await self.browser.page.evaluate("""
+                () => {
+                    const text = document.body.textContent || '';
+                    // Look for "Code: XXXXXX" pattern
+                    const codeMatch = text.match(/(?:code|Code)[:\\s]+([A-Z0-9]{6})/);
+                    if (codeMatch) return codeMatch[1];
+
+                    // Build code from parts in order
+                    const parts = [];
+                    document.querySelectorAll('div').forEach(el => {
+                        const t = (el.textContent || '').trim();
+                        const m = t.match(/Part\\s*(\\d+)[:\\s]*([A-Z0-9]{2,3})/i);
+                        if (m) parts.push({num: parseInt(m[1]), code: m[2]});
+                    });
+                    // Deduplicate by part number
+                    const unique = {};
+                    parts.forEach(p => { unique[p.num] = p.code; });
+                    const sorted = Object.keys(unique).sort((a,b) => a-b).map(k => unique[k]);
+                    if (sorted.length >= 2) return sorted.join('');
+                    return null;
+                }
+            """)
+            if assembled:
+                print(f"    -> assembled code: {assembled}", flush=True)
+                filled = await self._try_fill_code([assembled])
+                if filled:
+                    return True
+
+            return True
+        except Exception as e:
+            print(f"    -> split parts error: {e}", flush=True)
+            return False
+
+    async def _try_timing_challenge(self) -> bool:
+        """Handle Timing Challenge - click Capture while the window is active to reveal code."""
+        try:
+            # The challenge shows a code with a countdown. We must click "Capture Now!"
+            # while the timer is still active. Then the real code is revealed.
+            for attempt in range(5):
+                # Check if there's an active timing window (timer > 0)
+                state = await self.browser.page.evaluate("""
+                    () => {
+                        const text = document.body.textContent || '';
+                        const timerMatch = text.match(/(\\d+\\.?\\d*)\\s*seconds?\\s*remaining/i);
+                        const hasCapture = !!document.querySelector('button');
+                        const btns = [...document.querySelectorAll('button')];
+                        let captureBtn = null;
+                        for (const btn of btns) {
+                            const t = (btn.textContent || '').trim().toLowerCase();
+                            if (t.includes('capture') && btn.offsetParent && !btn.disabled) {
+                                captureBtn = t;
+                                break;
+                            }
+                        }
+                        return {
+                            timer: timerMatch ? parseFloat(timerMatch[1]) : null,
+                            captureBtn,
+                            hasCapture
+                        };
+                    }
+                """)
+                print(f"    -> timing state: timer={state.get('timer')}, btn={state.get('captureBtn')}", flush=True)
+
+                # Click Capture button immediately (timing is critical!)
+                clicked = await self.browser.page.evaluate("""
+                    () => {
+                        const btns = [...document.querySelectorAll('button')];
+                        for (const btn of btns) {
+                            const text = (btn.textContent || '').trim().toLowerCase();
+                            if (text.includes('capture') && btn.offsetParent && !btn.disabled) {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                """)
+
+                if clicked:
+                    print(f"    -> clicked Capture!", flush=True)
+                    await asyncio.sleep(0.5)
+
+                    # Check if real code was revealed
+                    html = await self.browser.get_html()
+                    codes = extract_hidden_codes(html)
+                    if codes:
+                        print(f"    -> post-capture codes: {codes}", flush=True)
+                        return True
+
+                    # If the window wasn't active, we might need to wait for the next cycle
+                    await asyncio.sleep(1.0)
+                else:
+                    # No capture button, wait for next timing window
+                    await asyncio.sleep(0.5)
+
+            return True
+        except Exception as e:
+            print(f"    -> timing error: {e}", flush=True)
+            return False
+
     async def _try_audio_challenge(self) -> bool:
-        """Handle Audio Challenge - capture audio via network + JS monkey-patch, transcribe with Gemini."""
+        """Handle Audio Challenge - intercept SpeechSynthesis/Audio/network, force-end speech."""
         try:
             import base64
             from google.genai import types
 
-            # Strategy 1: Monkey-patch Audio.prototype.play to capture src and reference
-            # This catches audio created via new Audio() that isn't in DOM
+            # Patches are already installed via add_init_script in browser.py.
+            # Reset capture state for this attempt.
             await self.browser.page.evaluate("""
                 () => {
-                    if (window.__audioPatched) return;
-                    window.__audioPatched = true;
-                    window.__capturedAudioSrc = null;
-                    window.__capturedAudio = null;
-                    const origPlay = HTMLAudioElement.prototype.play;
-                    HTMLAudioElement.prototype.play = function() {
-                        window.__capturedAudioSrc = this.src || this.currentSrc;
-                        window.__capturedAudio = this;
-                        return origPlay.call(this);
-                    };
+                    window.__capturedSpeechTexts = window.__capturedSpeechTexts || [];
+                    window.__capturedSpeechUtterance = window.__capturedSpeechUtterance || null;
+                    window.__speechDone = false;
                 }
             """)
 
-            # Strategy 2: Set up network response listener
+            # Network response listener for audio files
             audio_capture = {'data': None, 'mime': None}
 
             async def on_audio_response(response):
@@ -750,13 +960,13 @@ class ChallengeSolver:
 
             self.browser.page.on('response', on_audio_response)
 
-            # Click Play Audio button
+            # === PHASE 1: Click Play Audio button (but NOT "Playing...") ===
             play_result = await self.browser.page.evaluate("""
                 () => {
                     const btns = [...document.querySelectorAll('button')];
                     for (const btn of btns) {
                         const text = (btn.textContent || '').trim().toLowerCase();
-                        if ((text.includes('play') || text.includes('audio')) && btn.offsetParent) {
+                        if (text.includes('play') && !text.includes('playing') && btn.offsetParent) {
                             btn.click();
                             return 'clicked';
                         }
@@ -774,97 +984,94 @@ class ChallengeSolver:
                 return False
             print(f"    -> audio: {play_result}", flush=True)
 
-            # Wait for audio to be captured via network interception
-            for _ in range(10):
-                if audio_capture['data']:
-                    break
-                await asyncio.sleep(0.5)
+            # === PHASE 2: Wait briefly for speech, then force-end it ===
+            # Playwright's Chromium often has no TTS voices, so speechSynthesis.speak()
+            # never actually plays and the 'end' event never fires.
+            # Wait 3 seconds (enough for real speech), then force-trigger the end.
+            await asyncio.sleep(3.0)
 
-            # Fallback 1: Use monkey-patched Audio src to fetch audio directly
-            if not audio_capture['data']:
-                print(f"    -> network capture missed, trying JS monkey-patch fallback...", flush=True)
-                audio_info = await self.browser.page.evaluate("""
-                    async () => {
-                        const src = window.__capturedAudioSrc;
-                        if (!src) return {found: false, reason: 'no captured src'};
-                        try {
-                            const resp = await fetch(src);
-                            const ct = resp.headers.get('content-type') || 'audio/mpeg';
-                            const ab = await resp.arrayBuffer();
-                            const bytes = new Uint8Array(ab);
-                            let bin = '';
-                            for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-                            return {found: true, data: btoa(bin), mime: ct};
-                        } catch(e) { return {found: false, error: e.message}; }
+            # Check what we captured
+            captured_info = await self.browser.page.evaluate("""
+                () => ({
+                    speechTexts: window.__capturedSpeechTexts || [],
+                    audioSrc: window.__capturedAudioSrc,
+                    blobUrl: window.__capturedBlobUrl || null,
+                    hasBlobData: !!window.__capturedBlob,
+                    hasUtterance: !!window.__capturedSpeechUtterance,
+                    speaking: window.speechSynthesis ? window.speechSynthesis.speaking : false,
+                })
+            """)
+            speech_texts = captured_info.get('speechTexts', [])
+            print(f"    -> captured: speech={speech_texts}, audioSrc={bool(captured_info.get('audioSrc'))}, "
+                  f"speaking={captured_info.get('speaking')}, hasUtt={captured_info.get('hasUtterance')}", flush=True)
+
+            # Force-end the speech and dispatch 'end' event on the utterance.
+            # This triggers the React component's onend callback -> sets isPlaying=false
+            # -> button changes from "Playing..." to "Complete".
+            force_result = await self.browser.page.evaluate("""
+                () => {
+                    const result = {speechCanceled: false, endDispatched: false, onendCalled: false};
+
+                    // Cancel speechSynthesis
+                    if (window.speechSynthesis) {
+                        window.speechSynthesis.cancel();
+                        result.speechCanceled = true;
                     }
-                """)
-                if audio_info.get('found'):
-                    audio_capture['data'] = base64.b64decode(audio_info['data'])
-                    audio_capture['mime'] = audio_info.get('mime', 'audio/mpeg').split(';')[0]
-                    print(f"    -> captured audio via JS: {len(audio_capture['data'])} bytes", flush=True)
-                else:
-                    print(f"    -> JS fallback: {audio_info}", flush=True)
 
-            # Fallback 2: Performance API - find audio resources already loaded
-            if not audio_capture['data']:
-                print(f"    -> trying Performance API fallback...", flush=True)
-                audio_info = await self.browser.page.evaluate("""
-                    async () => {
-                        const entries = performance.getEntriesByType('resource');
-                        for (const entry of entries) {
-                            if (entry.name.match(/\\.(mp3|wav|ogg|webm|m4a)/i)) {
-                                try {
-                                    const resp = await fetch(entry.name);
-                                    const ct = resp.headers.get('content-type') || 'audio/mpeg';
-                                    const ab = await resp.arrayBuffer();
-                                    const bytes = new Uint8Array(ab);
-                                    let bin = '';
-                                    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-                                    return {found: true, data: btoa(bin), mime: ct, url: entry.name};
-                                } catch(e) {}
-                            }
+                    // Dispatch 'end' event on the captured utterance
+                    const utt = window.__capturedSpeechUtterance;
+                    if (utt) {
+                        // Try SpeechSynthesisEvent first
+                        try {
+                            utt.dispatchEvent(new SpeechSynthesisEvent('end', {utterance: utt}));
+                            result.endDispatched = true;
+                        } catch(e) {
+                            try {
+                                utt.dispatchEvent(new Event('end'));
+                                result.endDispatched = true;
+                            } catch(e2) {}
                         }
-                        return {found: false};
+                        // Also call onend directly (handles case where challenge set it after speak)
+                        if (utt.onend) {
+                            try {
+                                utt.onend(new Event('end'));
+                                result.onendCalled = true;
+                            } catch(e) {}
+                        }
                     }
-                """)
-                if audio_info.get('found'):
-                    audio_capture['data'] = base64.b64decode(audio_info['data'])
-                    audio_capture['mime'] = audio_info.get('mime', 'audio/mpeg').split(';')[0]
-                    print(f"    -> captured audio via Performance API: {len(audio_capture['data'])} bytes", flush=True)
 
-            # Fallback 3: DOM querySelector (audio might be in DOM on some versions)
-            if not audio_capture['data']:
-                audio_info = await self.browser.page.evaluate("""
-                    async () => {
-                        const audio = document.querySelector('audio');
-                        if (!audio) return {found: false};
-                        const src = audio.src || audio.currentSrc || (audio.querySelector('source') || {}).src;
-                        if (!src) return {found: false};
-                        try {
-                            const resp = await fetch(src);
-                            const ct = resp.headers.get('content-type') || 'audio/mpeg';
-                            const ab = await resp.arrayBuffer();
-                            const bytes = new Uint8Array(ab);
-                            let bin = '';
-                            for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-                            return {found: true, data: btoa(bin), mime: ct};
-                        } catch(e) { return {found: false, error: e.message}; }
+                    // Also force-end any Audio elements
+                    if (window.__capturedAudio) {
+                        window.__capturedAudio.pause();
+                        if (window.__capturedAudio.duration && isFinite(window.__capturedAudio.duration))
+                            window.__capturedAudio.currentTime = window.__capturedAudio.duration;
+                        window.__capturedAudio.dispatchEvent(new Event('ended'));
                     }
-                """)
-                if audio_info.get('found'):
-                    audio_capture['data'] = base64.b64decode(audio_info['data'])
-                    audio_capture['mime'] = audio_info.get('mime', 'audio/mpeg').split(';')[0]
-                    print(f"    -> captured audio via DOM: {len(audio_capture['data'])} bytes", flush=True)
+                    document.querySelectorAll('audio').forEach(a => {
+                        a.pause();
+                        if (a.duration && isFinite(a.duration)) a.currentTime = a.duration;
+                        a.dispatchEvent(new Event('ended'));
+                    });
 
-            self.browser.page.remove_listener('response', on_audio_response)
+                    return result;
+                }
+            """)
+            print(f"    -> force-end: {force_result}", flush=True)
 
-            # Transcribe with Gemini
+            # Wait for React to re-render after forced state change
+            await asyncio.sleep(1.0)
+
+            # Gather transcript
             transcript = None
-            if audio_capture['data']:
+            if speech_texts:
+                transcript = ' '.join(speech_texts)
+                print(f"    -> speech transcript: '{transcript}'", flush=True)
+
+            # If we have audio from network, transcribe with Gemini
+            if not transcript and audio_capture['data']:
                 audio_bytes = audio_capture['data']
                 mime_type = audio_capture['mime'] or 'audio/mpeg'
                 print(f"    -> sending {len(audio_bytes)} bytes ({mime_type}) to Gemini...", flush=True)
-
                 try:
                     response = self.vision.client.models.generate_content(
                         model=self.vision.model_name,
@@ -883,32 +1090,56 @@ class ChallengeSolver:
                     print(f"    -> audio transcript: '{transcript}'", flush=True)
                 except Exception as e:
                     print(f"    -> transcription error: {e}", flush=True)
-            else:
-                print(f"    -> FAILED: no audio data captured by any method", flush=True)
 
-            # Force audio to end - use monkey-patched reference (works even if not in DOM)
-            await self.browser.page.evaluate("""
-                () => {
-                    // Try monkey-patched reference first (catches new Audio() objects)
-                    if (window.__capturedAudio) {
-                        window.__capturedAudio.pause();
-                        if (window.__capturedAudio.duration && isFinite(window.__capturedAudio.duration))
-                            window.__capturedAudio.currentTime = window.__capturedAudio.duration;
-                        window.__capturedAudio.dispatchEvent(new Event('ended'));
+            # Try fetching from captured audio src
+            if not transcript and captured_info.get('audioSrc'):
+                print(f"    -> trying fetch from captured src...", flush=True)
+                audio_info = await self.browser.page.evaluate("""
+                    async () => {
+                        const src = window.__capturedAudioSrc;
+                        if (!src) return {found: false};
+                        try {
+                            const resp = await fetch(src);
+                            const ct = resp.headers.get('content-type') || 'audio/mpeg';
+                            const ab = await resp.arrayBuffer();
+                            const bytes = new Uint8Array(ab);
+                            let bin = '';
+                            for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+                            return {found: true, data: btoa(bin), mime: ct};
+                        } catch(e) { return {found: false, error: e.message}; }
                     }
-                    // Also try DOM audio elements
-                    document.querySelectorAll('audio').forEach(a => {
-                        a.pause();
-                        if (a.duration && isFinite(a.duration)) a.currentTime = a.duration;
-                        a.dispatchEvent(new Event('ended'));
-                    });
-                }
-            """)
-            await asyncio.sleep(0.5)
+                """)
+                if audio_info.get('found'):
+                    audio_bytes = base64.b64decode(audio_info['data'])
+                    mime_type = audio_info.get('mime', 'audio/mpeg').split(';')[0]
+                    print(f"    -> captured audio via src fetch: {len(audio_bytes)} bytes", flush=True)
+                    try:
+                        response = self.vision.client.models.generate_content(
+                            model=self.vision.model_name,
+                            contents=[
+                                types.Content(
+                                    role="user",
+                                    parts=[
+                                        types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+                                        types.Part.from_text(text="Transcribe this audio exactly. It contains a 6-character alphanumeric code. Return ONLY the code.")
+                                    ]
+                                )
+                            ],
+                            config=types.GenerateContentConfig(temperature=0.0)
+                        )
+                        transcript = response.text.strip()
+                        print(f"    -> src transcript: '{transcript}'", flush=True)
+                    except Exception as e:
+                        print(f"    -> src transcription error: {e}", flush=True)
 
-            # Click Complete/Done/Finish button
+            self.browser.page.remove_listener('response', on_audio_response)
+
+            if not transcript and not audio_capture['data'] and not speech_texts:
+                print(f"    -> no audio data captured by any method", flush=True)
+
+            # === PHASE 3: Click Complete button ===
+            complete_clicked = False
             for poll in range(6):
-                await asyncio.sleep(0.5)
                 btn_state = await self.browser.page.evaluate("""
                     () => {
                         const btns = [...document.querySelectorAll('button')];
@@ -925,54 +1156,82 @@ class ChallengeSolver:
                 """)
                 if btn_state == 'clicked':
                     print(f"    -> clicked Complete", flush=True)
+                    complete_clicked = True
                     break
-                if poll % 2 == 1:
-                    # Retry force-end
-                    await self.browser.page.evaluate("""
-                        () => {
-                            if (window.__capturedAudio) {
-                                window.__capturedAudio.pause();
-                                if (window.__capturedAudio.duration && isFinite(window.__capturedAudio.duration))
-                                    window.__capturedAudio.currentTime = window.__capturedAudio.duration;
-                                window.__capturedAudio.dispatchEvent(new Event('ended'));
+                await asyncio.sleep(0.5)
+
+            if not complete_clicked:
+                # Fallback: try Playwright click
+                for text in ['Complete', 'Done', 'Finish']:
+                    try:
+                        loc = self.browser.page.get_by_text(text, exact=False)
+                        if await loc.count() > 0:
+                            await loc.first.click(timeout=1000)
+                            print(f"    -> Playwright clicked '{text}'", flush=True)
+                            complete_clicked = True
+                            break
+                    except Exception:
+                        continue
+
+            if not complete_clicked:
+                # Last resort: click the "Playing..." button itself
+                # (it might be the same button that toggles to Complete)
+                print(f"    -> Complete not found, clicking Playing button as fallback", flush=True)
+                await self.browser.page.evaluate("""
+                    () => {
+                        const btns = [...document.querySelectorAll('button')];
+                        for (const btn of btns) {
+                            const text = (btn.textContent || '').trim().toLowerCase();
+                            if (text.includes('playing') && btn.offsetParent) {
+                                btn.click();
+                                return;
                             }
-                            document.querySelectorAll('audio').forEach(a => {
-                                a.pause();
-                                if (a.duration && isFinite(a.duration)) a.currentTime = a.duration;
-                                a.dispatchEvent(new Event('ended'));
-                            });
                         }
-                    """)
+                    }
+                """)
 
-            # Fallback Playwright click for Complete
-            for text in ['Complete', 'Done', 'Finish']:
-                try:
-                    loc = self.browser.page.get_by_text(text, exact=False)
-                    if await loc.count() > 0:
-                        await loc.first.click(timeout=1000)
-                        print(f"    -> Playwright clicked '{text}'", flush=True)
-                        break
-                except Exception:
-                    continue
+            await asyncio.sleep(1.0)
 
-            await asyncio.sleep(0.5)
+            # === PHASE 4: Extract codes from DOM after Complete reveals them ===
+            html = await self.browser.get_html()
+            dom_codes = extract_hidden_codes(html)
+            if dom_codes:
+                print(f"    -> post-complete dom_codes: {dom_codes}", flush=True)
+                filled = await self._try_fill_code(dom_codes)
+                if filled:
+                    return True
 
-            # Try transcript as code
+            # Try transcript-based codes (the hint itself might be the code,
+            # or the code might be embedded in the speech text)
             if transcript:
                 import re
                 codes_to_try = []
-                # Clean transcript and look for 6-char codes
+                # Extract the hint after "hint is:" pattern
+                hint_match = re.search(r'hint\s+is[:\s]+(.+)', transcript, re.IGNORECASE)
+                if hint_match:
+                    hint_part = hint_match.group(1).strip()
+                    hint_code = re.sub(r'[^A-Z0-9]', '', hint_part.upper())
+                    if len(hint_code) == 6:
+                        codes_to_try.append(hint_code)
+
+                # Also try the whole transcript cleaned up
                 clean_word = re.sub(r'[^A-Z0-9]', '', transcript.upper())
-                if len(clean_word) == 6:
-                    codes_to_try.insert(0, clean_word)
+                if len(clean_word) == 6 and clean_word not in codes_to_try:
+                    codes_to_try.append(clean_word)
+
+                # Find all 6-char sequences
                 found = re.findall(r'[A-Z0-9]{6}', transcript.upper().replace(' ', ''))
-                codes_to_try.extend(found)
+                for f in found:
+                    if f not in codes_to_try:
+                        codes_to_try.append(f)
+
                 # Individual words
                 for w in transcript.upper().split():
                     w = re.sub(r'[^A-Z0-9]', '', w)
                     if len(w) == 6 and w not in codes_to_try:
                         codes_to_try.append(w)
-                # Also try joining first letters of words (if code is spelled out letter by letter)
+
+                # Spelled-out letters (e.g., "P 4 H W B Q" -> "P4HWBQ")
                 letters = [w.strip().upper() for w in transcript.split() if len(w.strip()) == 1]
                 if len(letters) >= 6:
                     spelled = ''.join(letters[:6])
@@ -989,6 +1248,175 @@ class ChallengeSolver:
 
         except Exception as e:
             print(f"    -> audio error: {e}", flush=True)
+            return False
+
+    async def _try_video_challenge(self) -> bool:
+        """Handle Video Challenge - seek through frames to target, read code, submit."""
+        try:
+            # Parse target frame and current state from the page
+            state = await self.browser.page.evaluate("""
+                () => {
+                    const text = document.body.textContent || '';
+
+                    // Find target frame number (e.g., "navigate to frame 44")
+                    const targetMatch = text.match(/(?:frame|Frame)\\s+(\\d+)/g);
+                    let targetFrame = null;
+                    if (targetMatch) {
+                        for (const m of targetMatch) {
+                            const num = parseInt(m.match(/\\d+/)[0]);
+                            // Skip "Frame 0/60" style current-frame indicators
+                            if (num > 0 && num < 100) {
+                                targetFrame = num;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Find current frame
+                    const currentMatch = text.match(/Frame\\s+(\\d+)\\/(\\d+)/);
+                    const currentFrame = currentMatch ? parseInt(currentMatch[1]) : 0;
+                    const totalFrames = currentMatch ? parseInt(currentMatch[2]) : 60;
+
+                    // Find seek requirement
+                    const seekMatch = text.match(/(\\d+)\\/(\\d+)\\s*required/);
+                    const seeksDone = seekMatch ? parseInt(seekMatch[1]) : 0;
+                    const seeksRequired = seekMatch ? parseInt(seekMatch[2]) : 3;
+
+                    // Find buttons
+                    const btns = [...document.querySelectorAll('button')];
+                    const btnTexts = btns.filter(b => b.offsetParent).map(b => b.textContent.trim());
+
+                    return {targetFrame, currentFrame, totalFrames, seeksDone, seeksRequired, btnTexts};
+                }
+            """)
+            print(f"    -> video state: target={state.get('targetFrame')}, "
+                  f"current={state.get('currentFrame')}/{state.get('totalFrames')}, "
+                  f"seeks={state.get('seeksDone')}/{state.get('seeksRequired')}", flush=True)
+
+            target = state.get('targetFrame')
+            if target is None:
+                print(f"    -> no target frame found", flush=True)
+                return False
+
+            seeks_required = state.get('seeksRequired', 3)
+            seeks_done = state.get('seeksDone', 0)
+
+            # Step 1: Perform required seek operations using +1/-1/+10/-10 buttons
+            seek_count = 0
+            while seeks_done + seek_count < seeks_required:
+                # Click +1 button (simple, reliable seek)
+                clicked = await self.browser.page.evaluate("""
+                    () => {
+                        const btns = [...document.querySelectorAll('button')];
+                        for (const btn of btns) {
+                            const text = btn.textContent.trim();
+                            if (text === '+1' && btn.offsetParent) {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                        // Fallback: click any seek button
+                        for (const btn of btns) {
+                            const text = btn.textContent.trim();
+                            if ((text === '-1' || text === '+10' || text === '-10') && btn.offsetParent) {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                """)
+                if clicked:
+                    seek_count += 1
+                    print(f"    -> seek {seeks_done + seek_count}/{seeks_required}", flush=True)
+                    await asyncio.sleep(0.3)
+                else:
+                    break
+
+            # Step 2: Navigate to the target frame
+            # Try clicking "Frame N" button directly
+            nav_result = await self.browser.page.evaluate(f"""
+                () => {{
+                    const btns = [...document.querySelectorAll('button')];
+                    for (const btn of btns) {{
+                        const text = btn.textContent.trim();
+                        if (text.includes('Frame {target}') || text.includes('frame {target}')) {{
+                            btn.click();
+                            return 'direct';
+                        }}
+                    }}
+                    return 'not_found';
+                }}
+            """)
+            print(f"    -> navigate to frame {target}: {nav_result}", flush=True)
+
+            if nav_result == 'not_found':
+                # Manual navigation: use +10/-10 and +1/-1 to reach target
+                for _ in range(20):
+                    current = await self.browser.page.evaluate("""
+                        () => {
+                            const text = document.body.textContent || '';
+                            const m = text.match(/Frame\\s+(\\d+)\\//);
+                            return m ? parseInt(m[1]) : 0;
+                        }
+                    """)
+                    if current == target:
+                        break
+                    diff = target - current
+                    if abs(diff) >= 10:
+                        btn_text = '+10' if diff > 0 else '-10'
+                    else:
+                        btn_text = '+1' if diff > 0 else '-1'
+                    await self.browser.page.evaluate(f"""
+                        () => {{
+                            const btns = [...document.querySelectorAll('button')];
+                            for (const btn of btns) {{
+                                if (btn.textContent.trim() === '{btn_text}' && btn.offsetParent) {{
+                                    btn.click();
+                                    return;
+                                }}
+                            }}
+                        }}
+                    """)
+                    await asyncio.sleep(0.2)
+
+            await asyncio.sleep(0.5)
+
+            # Step 3: Click any "Seek N more times" or completion button
+            await self.browser.page.evaluate("""
+                () => {
+                    const btns = [...document.querySelectorAll('button')];
+                    for (const btn of btns) {
+                        const text = btn.textContent.trim().toLowerCase();
+                        if ((text.includes('complete') || text.includes('done') ||
+                             text.includes('reveal') || text.includes('submit')) &&
+                            btn.offsetParent && !btn.disabled) {
+                            btn.click();
+                        }
+                    }
+                }
+            """)
+            await asyncio.sleep(0.5)
+
+            # Step 4: Read the code displayed at the target frame
+            frame_code = await self.browser.page.evaluate(f"""
+                () => {{
+                    const text = document.body.textContent || '';
+                    // Check we're on the right frame
+                    const frameMatch = text.match(/Frame\\s+(\\d+)\\//);
+                    const currentFrame = frameMatch ? parseInt(frameMatch[1]) : -1;
+
+                    // Look for 6-char code in the video area
+                    const codeMatch = text.match(/\\b([A-Z0-9]{{6}})\\b/g);
+                    return {{currentFrame, codes: codeMatch || []}};
+                }}
+            """)
+            print(f"    -> at frame {frame_code.get('currentFrame')}, codes: {frame_code.get('codes')}", flush=True)
+
+            return True
+
+        except Exception as e:
+            print(f"    -> video error: {e}", flush=True)
             return False
 
     async def _try_drag_and_drop(self) -> bool:
@@ -1323,21 +1751,27 @@ class ChallengeSolver:
 
         for code in codes:
             try:
-                # Focus input and clear it first
-                has_input = await self.browser.page.evaluate("""
-                    () => {
-                        const input = document.querySelector('input[placeholder*="code"], input[type="text"]');
-                        if (input) {
-                            input.focus();
-                            input.value = '';
-                            return true;
-                        }
-                        return false;
-                    }
-                """)
-                if not has_input:
+                # Find the input field
+                input_loc = self.browser.page.locator(
+                    'input[placeholder*="code"], input[placeholder*="Code"], input[type="text"]'
+                ).first
+                if not await input_loc.count():
                     print(f"    -> no input field found", flush=True)
                     return False
+
+                # Clear properly for React: triple-click to select all, then backspace
+                try:
+                    await input_loc.click(click_count=3, timeout=1000)
+                except Exception:
+                    # Fallback: floating elements may block click - use JS focus + select
+                    await self.browser.page.evaluate("""
+                        () => {
+                            const input = document.querySelector('input[placeholder*="code"], input[placeholder*="Code"], input[type="text"]');
+                            if (input) { input.focus(); input.select(); }
+                        }
+                    """)
+                await self.browser.page.keyboard.press('Backspace')
+                await asyncio.sleep(0.1)
 
                 # Type character by character - this properly triggers React state updates
                 await self.browser.page.keyboard.type(code, delay=30)
