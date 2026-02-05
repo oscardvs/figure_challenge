@@ -291,6 +291,69 @@ class ChallengeSolver:
                                 print(f"  >>> PASSED <<<", flush=True)
                                 return True
 
+            # Handle Rotating Code Challenge (click Capture N times to reveal real code)
+            if 'rotating' in html_lower and 'capture' in html_lower:
+                rotate_result = await self._try_rotating_code_challenge()
+                if rotate_result:
+                    print(f"  rotating_code: completed", flush=True)
+                    await asyncio.sleep(0.5)
+                    html = await self.browser.get_html()
+                    dom_codes = extract_hidden_codes(html)
+                    if dom_codes:
+                        print(f"  post-rotate codes: {dom_codes}", flush=True)
+                        filled = await self._try_fill_code(dom_codes)
+                        if filled:
+                            url = await self.browser.get_url()
+                            if self._check_progress(url, challenge_num):
+                                self.metrics.end_challenge(
+                                    challenge_num, success=True,
+                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                )
+                                print(f"  >>> PASSED <<<", flush=True)
+                                return True
+
+            # Handle Multi-Tab Challenge (click through tabs to collect code parts)
+            if 'tab' in html_lower and ('puzzle' in html_lower or 'multi' in html_lower or 'visit' in html_lower):
+                tab_result = await self._try_multi_tab_challenge()
+                if tab_result:
+                    print(f"  multi_tab: completed", flush=True)
+                    await asyncio.sleep(0.5)
+                    html = await self.browser.get_html()
+                    dom_codes = extract_hidden_codes(html)
+                    if dom_codes:
+                        print(f"  post-tab codes: {dom_codes}", flush=True)
+                        filled = await self._try_fill_code(dom_codes)
+                        if filled:
+                            url = await self.browser.get_url()
+                            if self._check_progress(url, challenge_num):
+                                self.metrics.end_challenge(
+                                    challenge_num, success=True,
+                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                )
+                                print(f"  >>> PASSED <<<", flush=True)
+                                return True
+
+            # Handle Sequence Challenge (click button N times to progress and reveal code)
+            if 'sequence' in html_lower or ('progress' in html_lower and 'click' in html_lower):
+                seq_result = await self._try_sequence_challenge()
+                if seq_result:
+                    print(f"  sequence_challenge: completed", flush=True)
+                    await asyncio.sleep(0.5)
+                    html = await self.browser.get_html()
+                    dom_codes = extract_hidden_codes(html)
+                    if dom_codes:
+                        print(f"  post-sequence codes: {dom_codes}", flush=True)
+                        filled = await self._try_fill_code(dom_codes)
+                        if filled:
+                            url = await self.browser.get_url()
+                            if self._check_progress(url, challenge_num):
+                                self.metrics.end_challenge(
+                                    challenge_num, success=True,
+                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                )
+                                print(f"  >>> PASSED <<<", flush=True)
+                                return True
+
             # Handle Video Challenge (seek through frames to find code)
             if 'video' in html_lower and 'frame' in html_lower and 'seek' in html_lower:
                 video_result = await self._try_video_challenge()
@@ -722,16 +785,22 @@ class ChallengeSolver:
             return False
 
     async def _try_canvas_challenge(self) -> bool:
-        """Handle Canvas Challenge - draw 3+ mouse strokes on a canvas to reveal code."""
+        """Handle Canvas Challenge - draw shapes or strokes on a canvas to reveal code."""
         try:
-            # Find the canvas element and get its bounding box
+            # Find the canvas element and detect required shape
             canvas_info = await self.browser.page.evaluate("""
                 () => {
                     const canvas = document.querySelector('canvas');
                     if (!canvas) return {found: false};
                     canvas.scrollIntoView({behavior: 'instant', block: 'center'});
                     const rect = canvas.getBoundingClientRect();
-                    return {found: true, x: rect.x, y: rect.y, w: rect.width, h: rect.height};
+                    const text = document.body.textContent.toLowerCase();
+                    let shape = 'strokes';
+                    if (text.includes('square')) shape = 'square';
+                    else if (text.includes('circle')) shape = 'circle';
+                    else if (text.includes('triangle')) shape = 'triangle';
+                    else if (text.includes('line')) shape = 'line';
+                    return {found: true, x: rect.x, y: rect.y, w: rect.width, h: rect.height, shape};
                 }
             """)
 
@@ -743,27 +812,93 @@ class ChallengeSolver:
             cy = canvas_info['y']
             cw = canvas_info['w']
             ch = canvas_info['h']
-            print(f"    -> canvas found at ({cx:.0f},{cy:.0f}) size {cw:.0f}x{ch:.0f}", flush=True)
+            shape = canvas_info.get('shape', 'strokes')
+            print(f"    -> canvas found at ({cx:.0f},{cy:.0f}) size {cw:.0f}x{ch:.0f}, shape={shape}", flush=True)
 
-            # Draw 4 strokes (one extra for safety) - each stroke is mousedown → mousemove → mouseup
-            for i in range(4):
-                # Vary start/end positions so strokes are different
-                start_x = cx + cw * 0.2 + (i * cw * 0.15)
-                start_y = cy + ch * 0.3 + (i * ch * 0.1)
-                end_x = cx + cw * 0.5 + (i * cw * 0.1)
-                end_y = cy + ch * 0.7 - (i * ch * 0.05)
+            if shape == 'square':
+                # Draw a square: 4 connected sides
+                margin = 0.2
+                x1 = cx + cw * margin
+                y1 = cy + ch * margin
+                x2 = cx + cw * (1 - margin)
+                y2 = cy + ch * (1 - margin)
+                # Draw 4 sides as connected strokes
+                corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)]
+                await self.browser.page.mouse.move(corners[0][0], corners[0][1])
+                await self.browser.page.mouse.down()
+                for corner in corners[1:]:
+                    await self.browser.page.mouse.move(corner[0], corner[1], steps=15)
+                    await asyncio.sleep(0.05)
+                await self.browser.page.mouse.up()
+                print(f"    -> drew square", flush=True)
 
+            elif shape == 'circle':
+                # Draw a circle using many points
+                import math
+                center_x = cx + cw / 2
+                center_y = cy + ch / 2
+                radius = min(cw, ch) * 0.35
+                points = 36
+                start_x = center_x + radius
+                start_y = center_y
                 await self.browser.page.mouse.move(start_x, start_y)
                 await self.browser.page.mouse.down()
-                await asyncio.sleep(0.05)
-                # Move in steps to simulate actual drawing
-                await self.browser.page.mouse.move(end_x, end_y, steps=10)
-                await asyncio.sleep(0.05)
+                for i in range(1, points + 1):
+                    angle = (2 * math.pi * i) / points
+                    px = center_x + radius * math.cos(angle)
+                    py = center_y + radius * math.sin(angle)
+                    await self.browser.page.mouse.move(px, py, steps=3)
                 await self.browser.page.mouse.up()
-                print(f"    -> drew stroke {i+1}", flush=True)
-                await asyncio.sleep(0.3)
+                print(f"    -> drew circle", flush=True)
 
-            # Wait for code to appear after strokes
+            elif shape == 'triangle':
+                # Draw a triangle
+                margin = 0.2
+                top = (cx + cw / 2, cy + ch * margin)
+                bl = (cx + cw * margin, cy + ch * (1 - margin))
+                br = (cx + cw * (1 - margin), cy + ch * (1 - margin))
+                corners = [top, br, bl, top]
+                await self.browser.page.mouse.move(corners[0][0], corners[0][1])
+                await self.browser.page.mouse.down()
+                for corner in corners[1:]:
+                    await self.browser.page.mouse.move(corner[0], corner[1], steps=15)
+                    await asyncio.sleep(0.05)
+                await self.browser.page.mouse.up()
+                print(f"    -> drew triangle", flush=True)
+
+            else:
+                # Default: draw 4 varied strokes
+                for i in range(4):
+                    start_x = cx + cw * 0.2 + (i * cw * 0.15)
+                    start_y = cy + ch * 0.3 + (i * ch * 0.1)
+                    end_x = cx + cw * 0.5 + (i * cw * 0.1)
+                    end_y = cy + ch * 0.7 - (i * ch * 0.05)
+                    await self.browser.page.mouse.move(start_x, start_y)
+                    await self.browser.page.mouse.down()
+                    await asyncio.sleep(0.05)
+                    await self.browser.page.mouse.move(end_x, end_y, steps=10)
+                    await asyncio.sleep(0.05)
+                    await self.browser.page.mouse.up()
+                    print(f"    -> drew stroke {i+1}", flush=True)
+                    await asyncio.sleep(0.3)
+
+            # Click Complete/Done button after drawing
+            await asyncio.sleep(0.5)
+            await self.browser.page.evaluate("""
+                () => {
+                    const btns = [...document.querySelectorAll('button')];
+                    for (const btn of btns) {
+                        const t = (btn.textContent || '').trim().toLowerCase();
+                        if ((t.includes('complete') || t.includes('done') || t.includes('check') ||
+                             t.includes('verify') || t.includes('submit')) &&
+                            !t.includes('clear') && btn.offsetParent && !btn.disabled) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
             await asyncio.sleep(0.5)
             return True
 
@@ -923,6 +1058,232 @@ class ChallengeSolver:
             return True
         except Exception as e:
             print(f"    -> timing error: {e}", flush=True)
+            return False
+
+    async def _try_rotating_code_challenge(self) -> bool:
+        """Handle Rotating Code Challenge - click Capture N times, then submit revealed code."""
+        try:
+            for attempt in range(15):
+                # Check current state
+                state = await self.browser.page.evaluate("""
+                    () => {
+                        const text = document.body.textContent || '';
+                        // Parse "Capture (1/3)" or "1/3" pattern near capture button
+                        const btns = [...document.querySelectorAll('button')];
+                        let captureBtn = null;
+                        let done = 0, required = 3;
+                        for (const btn of btns) {
+                            const t = (btn.textContent || '').trim();
+                            const m = t.match(/[Cc]apture.*?(\\d+)\\/(\\d+)/);
+                            if (m) {
+                                captureBtn = btn;
+                                done = parseInt(m[1]);
+                                required = parseInt(m[2]);
+                                break;
+                            }
+                        }
+                        // Also check for a plain "Capture" button
+                        if (!captureBtn) {
+                            for (const btn of btns) {
+                                const t = (btn.textContent || '').trim().toLowerCase();
+                                if (t.includes('capture') && btn.offsetParent && !btn.disabled) {
+                                    captureBtn = btn;
+                                    break;
+                                }
+                            }
+                        }
+                        return {done, required, hasBtn: !!captureBtn, complete: done >= required};
+                    }
+                """)
+                print(f"    -> rotate state: {state.get('done')}/{state.get('required')}, "
+                      f"complete={state.get('complete')}", flush=True)
+
+                if state.get('complete'):
+                    # All captures done - look for revealed code
+                    await asyncio.sleep(0.5)
+                    return True
+
+                # Click Capture button
+                clicked = await self.browser.page.evaluate("""
+                    () => {
+                        const btns = [...document.querySelectorAll('button')];
+                        for (const btn of btns) {
+                            const t = (btn.textContent || '').trim().toLowerCase();
+                            if (t.includes('capture') && btn.offsetParent && !btn.disabled) {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                """)
+                if clicked:
+                    print(f"    -> clicked Capture", flush=True)
+                else:
+                    print(f"    -> no Capture button found", flush=True)
+
+                # Wait for next rotation cycle (code changes every 3 seconds)
+                await asyncio.sleep(1.0)
+
+            return True
+        except Exception as e:
+            print(f"    -> rotating code error: {e}", flush=True)
+            return False
+
+    async def _try_multi_tab_challenge(self) -> bool:
+        """Handle Multi-Tab Challenge - click through all tabs to collect code parts."""
+        try:
+            # Find and click each tab button, collecting parts from each
+            parts = {}
+            for round_num in range(3):
+                result = await self.browser.page.evaluate("""
+                    () => {
+                        const btns = [...document.querySelectorAll('button')];
+                        const tabBtns = btns.filter(b => {
+                            const t = (b.textContent || '').trim().toLowerCase();
+                            return (t.includes('tab') || t.match(/^\\d+$/)) && b.offsetParent;
+                        });
+
+                        // Click each tab and collect content
+                        const parts = {};
+                        for (const btn of tabBtns) {
+                            const tabName = btn.textContent.trim();
+                            btn.click();
+                            // Read content after clicking
+                            const text = document.body.textContent || '';
+                            // Look for code parts like "Part 1: AB" or just 2-3 char segments
+                            const partMatches = text.matchAll(/Part\\s*(\\d+)[:\\s]*([A-Z0-9]{2,3})/gi);
+                            for (const m of partMatches) {
+                                parts[parseInt(m[1])] = m[2].toUpperCase();
+                            }
+                            // Also look for any 6-char code that appears
+                            const codeMatch = text.match(/(?:code|Code)[:\\s]+([A-Z0-9]{6})/);
+                            if (codeMatch) parts['full'] = codeMatch[1];
+                        }
+
+                        return {
+                            tabCount: tabBtns.length,
+                            tabNames: tabBtns.map(b => b.textContent.trim()),
+                            parts,
+                        };
+                    }
+                """)
+                print(f"    -> tabs: {result.get('tabCount')}, names={result.get('tabNames')}, "
+                      f"parts={result.get('parts')}", flush=True)
+
+                tab_parts = result.get('parts', {})
+                if tab_parts.get('full'):
+                    print(f"    -> found full code: {tab_parts['full']}", flush=True)
+                    filled = await self._try_fill_code([tab_parts['full']])
+                    if filled:
+                        return True
+
+                # Merge parts
+                for k, v in tab_parts.items():
+                    if k != 'full':
+                        parts[k] = v
+
+                if len(parts) >= 2:
+                    sorted_keys = sorted(k for k in parts if k != 'full')
+                    assembled = ''.join(parts[k] for k in sorted_keys)
+                    if len(assembled) == 6:
+                        print(f"    -> assembled from tabs: {assembled}", flush=True)
+                        filled = await self._try_fill_code([assembled])
+                        if filled:
+                            return True
+
+                # Click tabs one by one with delay to trigger content changes
+                tab_count = result.get('tabCount', 0)
+                if tab_count > 0:
+                    for i in range(tab_count):
+                        await self.browser.page.evaluate(f"""
+                            () => {{
+                                const btns = [...document.querySelectorAll('button')];
+                                const tabBtns = btns.filter(b => {{
+                                    const t = (b.textContent || '').trim().toLowerCase();
+                                    return (t.includes('tab') || t.match(/^\\d+$/)) && b.offsetParent;
+                                }});
+                                if (tabBtns[{i}]) tabBtns[{i}].click();
+                            }}
+                        """)
+                        await asyncio.sleep(0.5)
+
+                    # After visiting all tabs, check for revealed content
+                    html = await self.browser.get_html()
+                    dom_codes = extract_hidden_codes(html)
+                    if dom_codes:
+                        print(f"    -> post-tabs codes: {dom_codes}", flush=True)
+                        filled = await self._try_fill_code(dom_codes)
+                        if filled:
+                            return True
+
+                await asyncio.sleep(0.5)
+
+            return True
+        except Exception as e:
+            print(f"    -> multi-tab error: {e}", flush=True)
+            return False
+
+    async def _try_sequence_challenge(self) -> bool:
+        """Handle Sequence Challenge - click action button repeatedly until progress completes."""
+        try:
+            for click_num in range(20):
+                # Check progress state
+                state = await self.browser.page.evaluate("""
+                    () => {
+                        const text = document.body.textContent || '';
+                        // Parse "Progress: 2/4" or "2/4 complete" or "Step 2 of 4"
+                        const progMatch = text.match(/(\\d+)\\s*\\/\\s*(\\d+)/);
+                        const done = progMatch ? parseInt(progMatch[1]) : 0;
+                        const total = progMatch ? parseInt(progMatch[2]) : 4;
+
+                        // Find clickable action button (not Submit, not navigation)
+                        const btns = [...document.querySelectorAll('button')];
+                        let actionBtn = null;
+                        for (const btn of btns) {
+                            const t = (btn.textContent || '').trim().toLowerCase();
+                            if (btn.offsetParent && !btn.disabled &&
+                                !t.includes('submit') && !t.includes('next') &&
+                                (t.includes('click') || t.includes('tap') ||
+                                 t.includes('press') || t.includes('action') ||
+                                 t.includes('go') || t.includes('do it'))) {
+                                actionBtn = t;
+                                btn.click();
+                                return {done, total, clicked: t, complete: done >= total};
+                            }
+                        }
+                        // Fallback: click any non-submit, non-nav colored button
+                        for (const btn of btns) {
+                            const t = (btn.textContent || '').trim().toLowerCase();
+                            const cls = btn.className || '';
+                            if (btn.offsetParent && !btn.disabled &&
+                                !t.includes('submit') && !t.includes('next') &&
+                                (cls.includes('violet') || cls.includes('purple') ||
+                                 cls.includes('blue') || cls.includes('cyan') ||
+                                 cls.includes('indigo'))) {
+                                btn.click();
+                                return {done, total, clicked: t, complete: done >= total};
+                            }
+                        }
+                        return {done, total, clicked: null, complete: done >= total};
+                    }
+                """)
+                print(f"    -> sequence: {state.get('done')}/{state.get('total')}, "
+                      f"clicked={state.get('clicked')}", flush=True)
+
+                if state.get('complete'):
+                    await asyncio.sleep(0.5)
+                    return True
+
+                if state.get('clicked') is None:
+                    # No action button found - try generic click
+                    break
+
+                await asyncio.sleep(0.5)
+
+            return True
+        except Exception as e:
+            print(f"    -> sequence error: {e}", flush=True)
             return False
 
     async def _try_audio_challenge(self) -> bool:
