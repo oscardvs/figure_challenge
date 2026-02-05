@@ -460,7 +460,9 @@ class ChallengeSolver:
                                 return True
 
             # Handle Shadow DOM Challenge (navigate through shadow DOM layers)
-            if 'shadow' in html_lower and ('layer' in html_lower or 'level' in html_lower or 'dom' in html_lower):
+            # Be specific: check for "Shadow DOM" or "Shadow Level" in text (not CSS shadow-* classes)
+            if ('shadow dom' in html_lower or 'shadow level' in html_lower or
+                'shadow layer' in html_lower):
                 shadow_result = await self._try_shadow_dom_challenge()
                 if shadow_result:
                     print(f"  shadow_dom: completed", flush=True)
@@ -2814,7 +2816,11 @@ class ChallengeSolver:
                                 const t = (btn.textContent || '').trim().toLowerCase();
                                 if ((t.includes('enter level') || t.includes('go deeper') ||
                                      t.includes('next level') || t.includes('descend') ||
-                                     t.includes('go to level')) && btn.offsetParent !== null) {
+                                     t.includes('go to level')) && !btn.disabled) {
+                                    // Force visibility and click
+                                    btn.scrollIntoView({behavior: 'instant', block: 'center'});
+                                    btn.style.visibility = 'visible';
+                                    btn.style.display = '';
                                     btn.click();
                                     return t;
                                 }
@@ -2836,6 +2842,20 @@ class ChallengeSolver:
                     print(f"    -> clicked: {clicked}", flush=True)
                     await asyncio.sleep(0.5)
                 else:
+                    # Try Playwright text-based click
+                    pw_clicked = False
+                    for text in ['Enter Level', 'Go Deeper', 'Next Level', 'Descend']:
+                        try:
+                            await self.browser.page.click(f"button:has-text('{text}')", timeout=1000)
+                            print(f"    -> Playwright clicked '{text}'", flush=True)
+                            pw_clicked = True
+                            await asyncio.sleep(0.5)
+                            break
+                        except Exception:
+                            continue
+                    if pw_clicked:
+                        continue
+
                     # No button found - try using Playwright frame handling
                     frames = self.browser.page.frames
                     print(f"    -> no enter button, {len(frames)} frames total", flush=True)
