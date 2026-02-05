@@ -1417,13 +1417,12 @@ class ChallengeSolver:
     async def _try_math_puzzle_challenge(self) -> bool:
         """Handle Math/Puzzle Challenge - solve expression, type answer, click Solve."""
         try:
-            result = await self.browser.page.evaluate("""
+            # Step 1: Parse the math expression
+            expr = await self.browser.page.evaluate("""
                 () => {
                     const text = document.body.textContent || '';
-                    // Find math expression: "28 + 8 = ?" or "15 * 3 = ?"
                     const mathMatch = text.match(/(\\d+)\\s*([+\\-*×÷\\/])\\s*(\\d+)\\s*=\\s*\\?/);
-                    if (!mathMatch) return {found: false, reason: 'no math expression'};
-
+                    if (!mathMatch) return null;
                     const a = parseInt(mathMatch[1]);
                     const op = mathMatch[2];
                     const b = parseInt(mathMatch[3]);
@@ -1435,40 +1434,56 @@ class ChallengeSolver:
                         case '/': case '÷': answer = Math.floor(a / b); break;
                         default: answer = a + b;
                     }
-
-                    // Find the number input and fill it
-                    const input = document.querySelector('input[type="number"]') ||
-                                  document.querySelector('input[inputmode="numeric"]') ||
-                                  document.querySelector('input');
-                    if (input) {
-                        // React-compatible value setting
-                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                            window.HTMLInputElement.prototype, 'value').set;
-                        nativeInputValueSetter.call(input, String(answer));
-                        input.dispatchEvent(new Event('input', {bubbles: true}));
-                        input.dispatchEvent(new Event('change', {bubbles: true}));
-                    }
-
-                    // Click Solve button
-                    const btns = [...document.querySelectorAll('button')];
-                    let solved = false;
-                    for (const btn of btns) {
-                        const t = (btn.textContent || '').trim().toLowerCase();
-                        if ((t.includes('solve') || t.includes('check') || t.includes('verify') ||
-                             t.includes('answer')) && btn.offsetParent && !btn.disabled) {
-                            btn.click();
-                            solved = true;
-                            break;
-                        }
-                    }
-
-                    return {found: true, expression: `${a} ${op} ${b}`, answer, solved};
+                    return {a, op, b, answer};
                 }
             """)
-            print(f"    -> puzzle: {result}", flush=True)
-
-            if not result.get('found'):
+            if not expr:
                 return False
+            print(f"    -> puzzle: {expr['a']} {expr['op']} {expr['b']} = {expr['answer']}", flush=True)
+
+            # Step 2: Find and fill the number input via JS
+            await self.browser.page.evaluate(f"""
+                () => {{
+                    const input = document.querySelector('input[type="number"]') ||
+                                  document.querySelector('input[inputmode="numeric"]');
+                    if (input) {{
+                        input.scrollIntoView({{behavior: 'instant', block: 'center'}});
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value').set;
+                        nativeInputValueSetter.call(input, '{expr["answer"]}');
+                        input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    }}
+                }}
+            """)
+            await asyncio.sleep(0.3)
+
+            # Step 3: Click Solve button - scroll into view first, don't require offsetParent
+            solved = await self.browser.page.evaluate("""
+                () => {
+                    const btns = [...document.querySelectorAll('button')];
+                    for (const btn of btns) {
+                        const t = (btn.textContent || '').trim().toLowerCase();
+                        if ((t.includes('solve') || t === 'check' || t === 'verify' ||
+                             t === 'answer') && !btn.disabled) {
+                            btn.scrollIntoView({behavior: 'instant', block: 'center'});
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            print(f"    -> solve clicked: {solved}", flush=True)
+
+            if not solved:
+                # Fallback: try Playwright click
+                try:
+                    await self.browser.page.click("button:has-text('Solve')", timeout=2000)
+                    print(f"    -> Playwright clicked Solve", flush=True)
+                    solved = True
+                except Exception:
+                    pass
 
             await asyncio.sleep(1.0)
             return True
@@ -2302,25 +2317,33 @@ class ChallengeSolver:
 
         for code in codes:
             try:
-                # Find the input field
-                input_loc = self.browser.page.locator(
-                    'input[placeholder*="code"], input[placeholder*="Code"], input[type="text"]'
-                ).first
-                if not await input_loc.count():
+                # Scroll the code input into view and focus it via JS first
+                # This avoids issues with number inputs or other fields stealing focus
+                focused = await self.browser.page.evaluate("""
+                    () => {
+                        // Find code input specifically (not number inputs from puzzles)
+                        const selectors = [
+                            'input[placeholder*="code" i]',
+                            'input[placeholder*="enter" i][type="text"]',
+                            'input[type="text"]:not([type="number"])',
+                        ];
+                        for (const sel of selectors) {
+                            const input = document.querySelector(sel);
+                            if (input && input.offsetParent) {
+                                input.scrollIntoView({behavior: 'instant', block: 'center'});
+                                input.focus();
+                                input.select();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                """)
+                if not focused:
                     print(f"    -> no input field found", flush=True)
                     return False
 
-                # Clear properly for React: triple-click to select all, then backspace
-                try:
-                    await input_loc.click(click_count=3, timeout=1000)
-                except Exception:
-                    # Fallback: floating elements may block click - use JS focus + select
-                    await self.browser.page.evaluate("""
-                        () => {
-                            const input = document.querySelector('input[placeholder*="code"], input[placeholder*="Code"], input[type="text"]');
-                            if (input) { input.focus(); input.select(); }
-                        }
-                    """)
+                await asyncio.sleep(0.1)
                 await self.browser.page.keyboard.press('Backspace')
                 await asyncio.sleep(0.1)
 
