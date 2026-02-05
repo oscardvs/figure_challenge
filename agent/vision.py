@@ -33,8 +33,8 @@ class VisionAnalyzer:
         # Use Gemini 3 Flash Preview - fast and intelligent
         self.model_name = "gemini-3-flash-preview"
 
-    # Thinking budget levels: start at 0, escalate as attempts fail
-    THINKING_BUDGETS = [1024, 2048, 4096, 8192, 8192, 8192]
+    # Thinking budget levels: start higher, escalate as attempts fail
+    THINKING_BUDGETS = [2048, 4096, 4096, 8192, 8192, 8192, 8192, 8192, 8192, 8192]
 
     def analyze_page(
         self,
@@ -42,31 +42,61 @@ class VisionAnalyzer:
         html: str,
         challenge_num: int,
         dom_codes: list[str],
-        attempt: int = 0
+        attempt: int = 0,
+        failed_codes: list[str] | None = None
     ) -> tuple[ActionResponse, int, int]:
         """
         Analyze page and return next action.
         attempt: current attempt number, used to scale thinking budget.
+        failed_codes: codes already tried and failed on this step.
         Returns: (action, input_tokens, output_tokens)
         """
 
-        prompt = f"""Browser automation agent. Challenge {challenge_num}/30. Find 6-char alphanumeric code and enter it to proceed.
+        failed_info = ""
+        if failed_codes:
+            failed_info = f"\nPreviously tried codes that FAILED (do NOT suggest these): {failed_codes}"
 
-Known codes from DOM: {dom_codes}
+        prompt = f"""You are a browser automation agent solving challenge {challenge_num}/30.
+Each challenge hides a 6-character alphanumeric code (like "TWA8Q7", "P4HWBQ"). Find it and enter it to proceed.
+
+Known codes extracted from DOM: {dom_codes}{failed_info}
+
+CHALLENGE TYPES you may encounter:
+1. HIDDEN CODE: Code in HTML comments, data-* attributes, hidden elements, Base64 strings, or aria-* attributes
+2. SCROLL REVEAL: Must scroll down/up to reveal the code or a button
+3. HOVER REVEAL: Must hover over a specific element for 1+ second to reveal code
+4. CLICK REVEAL: Must click "Reveal Code" or similar buttons
+5. TIMER/COUNTDOWN: Wait for countdown to finish, then code appears
+6. RADIO MODAL: Modal with radio options - select "correct" option and click "Submit & Continue"
+7. KEYBOARD SEQUENCE: Press key combos (Ctrl+A, Shift+K) to reveal code
+8. DRAG AND DROP: Drag pieces into slots to assemble the code
+9. CANVAS DRAWING: Draw shapes on a canvas element
+10. TIMING CAPTURE: Click "Capture" while a timing window is active
+11. AUDIO: Play audio, listen for spelled-out code, click Complete
+12. SPLIT PARTS: Code parts scattered across page - click each to collect
+13. ROTATING CODE: Click "Capture" multiple times as code rotates
+14. MULTI-TAB: Click through tabs to collect code parts
+15. SEQUENCE: Perform 4 actions (click, hover, type, scroll) in sequence
+16. MATH PUZZLE: Solve math expression, type answer, click Solve
+17. VIDEO FRAMES: Seek to a specific frame number to find the code
+18. FAKE POPUPS: Popups with fake close buttons - find the real dismiss button
+19. TRAP BUTTONS: Many similar buttons but only one is real
 
 RULES:
-- ALL popup close buttons (X, Close, Dismiss) may be FAKE - popups are removed by our code, ignore them
-- Find the 6-char alphanumeric code (like "TWA8Q7") - it's NOT a common English word
-- If there's a scrollable modal, scroll it to find radio buttons or hidden content
-- If there's a "Reveal Code" button, click it
+- The code is ALWAYS exactly 6 characters, uppercase letters A-Z and digits 0-9 only
+- It is NOT a common English word (not BUTTON, SCROLL, HIDDEN, etc.)
+- Look carefully at the screenshot for any visible 6-char alphanumeric code
+- Popup close buttons (X, Close, Dismiss) are often FAKE - our code handles popups already
 - Use CSS selectors ONLY: .class, #id, button[type="submit"], input[type="text"]
-- Do NOT use Playwright selectors like :has-text() - they won't work
+- Do NOT use Playwright selectors like :has-text()
+- If you see the code in the screenshot but not in the DOM codes list, report it in code_found
+- If a code from DOM was already tried and failed, look for a DIFFERENT code (maybe hidden in the page)
 
 JSON response (no markdown):
-{{"action_type":"click|type|scroll","target_selector":"CSS selector","value":"text if typing","code_found":"ABC123 if found","reasoning":"brief"}}"""
+{{"action_type":"click|type|scroll|hover|wait|extract_code","target_selector":"CSS selector","value":"text to type","code_found":"ABC123 or null","reasoning":"what you see and what action to take"}}"""
 
-        # Truncate HTML aggressively for speed
-        html_truncated = html[:3000] if len(html) > 3000 else html
+        # Truncate HTML for context (5000 chars provides good coverage)
+        html_truncated = html[:5000] if len(html) > 5000 else html
 
         # Scale thinking budget based on attempt number
         budget_idx = min(attempt, len(self.THINKING_BUDGETS) - 1)

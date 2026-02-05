@@ -84,7 +84,7 @@ class ChallengeSolver:
         return False
 
     async def _solve_challenge(self, challenge_num: int) -> bool:
-        """Solve challenge using brute-force + DOM parsing (fast, no vision)."""
+        """Solve challenge: attempt 0 uses fast DOM parsing + heuristics, attempts 1+ use Gemini Flash 3 AI vision."""
         total_tokens_in = 0
         total_tokens_out = 0
 
@@ -96,7 +96,7 @@ class ChallengeSolver:
         if not content_loaded:
             print(f"  WARNING: page content didn't load, continuing anyway", flush=True)
 
-        stale_recovery_done = False  # Only try React state reset once per step
+        radio_brute_forced = False  # Only brute-force radio modal once per step
 
         for attempt in range(20):  # More attempts, faster
             url = await self.browser.get_url()
@@ -116,11 +116,23 @@ class ChallengeSolver:
             if special.get('handled'):
                 print(f"  special: {special}", flush=True)
 
-            # Radio modals are handled in _handle_special_challenges (nativeSetter + hide)
-            # Check if the special handler's radio+submit caused navigation
+            # Check if the special handler's JS radio+submit caused navigation
             if special.get('modal_closed'):
                 url = await self.browser.get_url()
                 if self._check_progress(url, challenge_num):
+                    self.metrics.end_challenge(
+                        challenge_num, success=True,
+                        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                    )
+                    print(f"  >>> PASSED <<<", flush=True)
+                    return True
+
+            # Brute-force radio modal: try ALL options with Playwright force=True
+            # If all wrong, inject permanent CSS to hide the modal (survives React re-renders)
+            if not radio_brute_forced and special.get('has_radio_modal'):
+                radio_brute_forced = True
+                brute_result = await self._try_brute_force_radio(challenge_num)
+                if brute_result:
                     self.metrics.end_challenge(
                         challenge_num, success=True,
                         tokens_in=total_tokens_in, tokens_out=total_tokens_out
@@ -150,261 +162,273 @@ class ChallengeSolver:
                             return True
                 continue  # Skip brute force on timer attempts
 
-            # Handle Keyboard Sequence Challenge (press key combos to reveal code)
-            html_check = await self.browser.get_html()
-            if 'keyboard sequence' in html_check.lower() or ('press' in html_check.lower() and 'keys in sequence' in html_check.lower()):
-                kbd_result = await self._try_keyboard_sequence(html_check)
-                if kbd_result:
-                    print(f"  keyboard_sequence: completed", flush=True)
-                    await asyncio.sleep(0.2)
-                    # Re-extract codes after sequence completes
-                    html = await self.browser.get_html()
-                    dom_codes = extract_hidden_codes(html)
-                    if dom_codes:
-                        print(f"  post-keyboard codes: {dom_codes}", flush=True)
-                        filled = await self._try_fill_code(dom_codes)
-                        if filled:
-                            url = await self.browser.get_url()
-                            if self._check_progress(url, challenge_num):
-                                self.metrics.end_challenge(
-                                    challenge_num, success=True,
-                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
-                                )
-                                print(f"  >>> PASSED <<<", flush=True)
-                                return True
+            # Challenge-type handlers run on attempts 0-1 (fast heuristic path)
+            # AI vision handles attempts 2+ as the primary solver
+            if attempt <= 1:
+                # Handle Keyboard Sequence Challenge (press key combos to reveal code)
+                html_check = await self.browser.get_html()
+                if 'keyboard sequence' in html_check.lower() or ('press' in html_check.lower() and 'keys in sequence' in html_check.lower()):
+                    kbd_result = await self._try_keyboard_sequence(html_check)
+                    if kbd_result:
+                        print(f"  keyboard_sequence: completed", flush=True)
+                        await asyncio.sleep(0.2)
+                        # Re-extract codes after sequence completes
+                        html = await self.browser.get_html()
+                        dom_codes = extract_hidden_codes(html)
+                        if dom_codes:
+                            print(f"  post-keyboard codes: {dom_codes}", flush=True)
+                            filled = await self._try_fill_code(dom_codes)
+                            if filled:
+                                url = await self.browser.get_url()
+                                if self._check_progress(url, challenge_num):
+                                    self.metrics.end_challenge(
+                                        challenge_num, success=True,
+                                        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                    )
+                                    print(f"  >>> PASSED <<<", flush=True)
+                                    return True
 
-            # Handle Drag-and-Drop Challenge (fill slots with pieces to reveal code)
-            html_lower = html_check.lower()
-            if 'drag' in html_lower and 'drop' in html_lower and 'slot' in html_lower:
-                dnd_result = await self._try_drag_and_drop()
-                if dnd_result:
-                    print(f"  drag_and_drop: completed", flush=True)
-                    await asyncio.sleep(0.2)
-                    # Re-extract codes after filling slots
-                    html = await self.browser.get_html()
-                    dom_codes = extract_hidden_codes(html)
-                    if dom_codes:
-                        print(f"  post-dnd codes: {dom_codes}", flush=True)
-                        filled = await self._try_fill_code(dom_codes)
-                        if filled:
-                            url = await self.browser.get_url()
-                            if self._check_progress(url, challenge_num):
-                                self.metrics.end_challenge(
-                                    challenge_num, success=True,
-                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
-                                )
-                                print(f"  >>> PASSED <<<", flush=True)
-                                return True
+                # Handle Drag-and-Drop Challenge (fill slots with pieces to reveal code)
+                html_lower = html_check.lower()
+                if 'drag' in html_lower and 'drop' in html_lower and 'slot' in html_lower:
+                    dnd_result = await self._try_drag_and_drop()
+                    if dnd_result:
+                        print(f"  drag_and_drop: completed", flush=True)
+                        await asyncio.sleep(0.2)
+                        # Re-extract codes after filling slots
+                        html = await self.browser.get_html()
+                        dom_codes = extract_hidden_codes(html)
+                        if dom_codes:
+                            print(f"  post-dnd codes: {dom_codes}", flush=True)
+                            filled = await self._try_fill_code(dom_codes)
+                            if filled:
+                                url = await self.browser.get_url()
+                                if self._check_progress(url, challenge_num):
+                                    self.metrics.end_challenge(
+                                        challenge_num, success=True,
+                                        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                    )
+                                    print(f"  >>> PASSED <<<", flush=True)
+                                    return True
 
-            # Handle Hover Challenge (hover over element to reveal code)
-            if 'hover' in html_lower and ('reveal' in html_lower or 'code' in html_lower):
-                hover_result = await self._try_hover_challenge()
-                if hover_result:
-                    print(f"  hover_challenge: completed", flush=True)
-                    await asyncio.sleep(0.1)
-                    html = await self.browser.get_html()
-                    dom_codes = extract_hidden_codes(html)
-                    if dom_codes:
-                        print(f"  post-hover codes: {dom_codes}", flush=True)
-                        filled = await self._try_fill_code(dom_codes)
-                        if filled:
-                            url = await self.browser.get_url()
-                            if self._check_progress(url, challenge_num):
-                                self.metrics.end_challenge(
-                                    challenge_num, success=True,
-                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
-                                )
-                                print(f"  >>> PASSED <<<", flush=True)
-                                return True
+                # Handle Hover Challenge (hover over element to reveal code)
+                if 'hover' in html_lower and ('reveal' in html_lower or 'code' in html_lower):
+                    hover_result = await self._try_hover_challenge()
+                    if hover_result:
+                        print(f"  hover_challenge: completed", flush=True)
+                        await asyncio.sleep(0.1)
+                        html = await self.browser.get_html()
+                        dom_codes = extract_hidden_codes(html)
+                        if dom_codes:
+                            print(f"  post-hover codes: {dom_codes}", flush=True)
+                            filled = await self._try_fill_code(dom_codes)
+                            if filled:
+                                url = await self.browser.get_url()
+                                if self._check_progress(url, challenge_num):
+                                    self.metrics.end_challenge(
+                                        challenge_num, success=True,
+                                        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                    )
+                                    print(f"  >>> PASSED <<<", flush=True)
+                                    return True
 
-            # Handle Canvas Challenge (draw 3+ strokes on canvas to reveal code)
-            if 'canvas' in html_lower and ('stroke' in html_lower or 'draw' in html_lower):
-                canvas_result = await self._try_canvas_challenge()
-                if canvas_result:
-                    print(f"  canvas_challenge: completed", flush=True)
-                    await asyncio.sleep(0.2)
-                    html = await self.browser.get_html()
-                    dom_codes = extract_hidden_codes(html)
-                    if dom_codes:
-                        print(f"  post-canvas codes: {dom_codes}", flush=True)
-                        filled = await self._try_fill_code(dom_codes)
-                        if filled:
-                            url = await self.browser.get_url()
-                            if self._check_progress(url, challenge_num):
-                                self.metrics.end_challenge(
-                                    challenge_num, success=True,
-                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
-                                )
-                                print(f"  >>> PASSED <<<", flush=True)
-                                return True
+                # Handle Canvas Challenge (draw 3+ strokes on canvas to reveal code)
+                if 'canvas' in html_lower and ('stroke' in html_lower or 'draw' in html_lower):
+                    canvas_result = await self._try_canvas_challenge()
+                    if canvas_result:
+                        print(f"  canvas_challenge: completed", flush=True)
+                        await asyncio.sleep(0.2)
+                        html = await self.browser.get_html()
+                        dom_codes = extract_hidden_codes(html)
+                        if dom_codes:
+                            print(f"  post-canvas codes: {dom_codes}", flush=True)
+                            filled = await self._try_fill_code(dom_codes)
+                            if filled:
+                                url = await self.browser.get_url()
+                                if self._check_progress(url, challenge_num):
+                                    self.metrics.end_challenge(
+                                        challenge_num, success=True,
+                                        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                    )
+                                    print(f"  >>> PASSED <<<", flush=True)
+                                    return True
 
-            # Handle Timing Challenge (click Capture while window is active)
-            if 'timing' in html_lower and 'capture' in html_lower and 'active' in html_lower:
-                timing_result = await self._try_timing_challenge()
-                if timing_result:
-                    print(f"  timing_challenge: completed", flush=True)
-                    await asyncio.sleep(0.2)
-                    html = await self.browser.get_html()
-                    dom_codes = extract_hidden_codes(html)
-                    if dom_codes:
-                        print(f"  post-timing codes: {dom_codes}", flush=True)
-                        filled = await self._try_fill_code(dom_codes)
-                        if filled:
-                            url = await self.browser.get_url()
-                            if self._check_progress(url, challenge_num):
-                                self.metrics.end_challenge(
-                                    challenge_num, success=True,
-                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
-                                )
-                                print(f"  >>> PASSED <<<", flush=True)
-                                return True
+                # Handle Timing Challenge (click Capture while window is active)
+                if 'timing' in html_lower and 'capture' in html_lower and 'active' in html_lower:
+                    timing_result = await self._try_timing_challenge()
+                    if timing_result:
+                        print(f"  timing_challenge: completed", flush=True)
+                        await asyncio.sleep(0.2)
+                        html = await self.browser.get_html()
+                        dom_codes = extract_hidden_codes(html)
+                        if dom_codes:
+                            print(f"  post-timing codes: {dom_codes}", flush=True)
+                            filled = await self._try_fill_code(dom_codes)
+                            if filled:
+                                url = await self.browser.get_url()
+                                if self._check_progress(url, challenge_num):
+                                    self.metrics.end_challenge(
+                                        challenge_num, success=True,
+                                        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                    )
+                                    print(f"  >>> PASSED <<<", flush=True)
+                                    return True
 
-            # Handle Audio Challenge (play audio, click complete to reveal code)
-            if 'audio' in html_lower and ('play' in html_lower or 'listen' in html_lower):
-                audio_result = await self._try_audio_challenge()
-                if audio_result:
-                    print(f"  audio_challenge: completed", flush=True)
-                    await asyncio.sleep(0.2)
-                    html = await self.browser.get_html()
-                    dom_codes = extract_hidden_codes(html)
-                    if dom_codes:
-                        print(f"  post-audio codes: {dom_codes}", flush=True)
-                        filled = await self._try_fill_code(dom_codes)
-                        if filled:
-                            url = await self.browser.get_url()
-                            if self._check_progress(url, challenge_num):
-                                self.metrics.end_challenge(
-                                    challenge_num, success=True,
-                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
-                                )
-                                print(f"  >>> PASSED <<<", flush=True)
-                                return True
+                # Handle Audio Challenge (play audio, click complete to reveal code)
+                if 'audio' in html_lower and ('play' in html_lower or 'listen' in html_lower):
+                    audio_result = await self._try_audio_challenge()
+                    if audio_result:
+                        print(f"  audio_challenge: completed", flush=True)
+                        await asyncio.sleep(0.2)
+                        html = await self.browser.get_html()
+                        dom_codes = extract_hidden_codes(html)
+                        if dom_codes:
+                            print(f"  post-audio codes: {dom_codes}", flush=True)
+                            filled = await self._try_fill_code(dom_codes)
+                            if filled:
+                                url = await self.browser.get_url()
+                                if self._check_progress(url, challenge_num):
+                                    self.metrics.end_challenge(
+                                        challenge_num, success=True,
+                                        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                    )
+                                    print(f"  >>> PASSED <<<", flush=True)
+                                    return True
 
-            # Handle Split Parts Challenge (click scattered parts to assemble code)
-            if 'split' in html_lower and 'part' in html_lower and ('found' in html_lower or 'click' in html_lower):
-                split_result = await self._try_split_parts_challenge()
-                if split_result:
-                    print(f"  split_parts: completed", flush=True)
-                    await asyncio.sleep(0.2)
-                    html = await self.browser.get_html()
-                    dom_codes = extract_hidden_codes(html)
-                    if dom_codes:
-                        print(f"  post-split codes: {dom_codes}", flush=True)
-                        filled = await self._try_fill_code(dom_codes)
-                        if filled:
-                            url = await self.browser.get_url()
-                            if self._check_progress(url, challenge_num):
-                                self.metrics.end_challenge(
-                                    challenge_num, success=True,
-                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
-                                )
-                                print(f"  >>> PASSED <<<", flush=True)
-                                return True
+                # Handle Split Parts Challenge (click scattered parts to assemble code)
+                if 'split' in html_lower and 'part' in html_lower and ('found' in html_lower or 'click' in html_lower):
+                    split_result = await self._try_split_parts_challenge()
+                    if split_result:
+                        print(f"  split_parts: completed", flush=True)
+                        await asyncio.sleep(0.2)
+                        html = await self.browser.get_html()
+                        dom_codes = extract_hidden_codes(html)
+                        if dom_codes:
+                            print(f"  post-split codes: {dom_codes}", flush=True)
+                            filled = await self._try_fill_code(dom_codes)
+                            if filled:
+                                url = await self.browser.get_url()
+                                if self._check_progress(url, challenge_num):
+                                    self.metrics.end_challenge(
+                                        challenge_num, success=True,
+                                        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                    )
+                                    print(f"  >>> PASSED <<<", flush=True)
+                                    return True
 
-            # Handle Rotating Code Challenge (click Capture N times to reveal real code)
-            if 'rotating' in html_lower and 'capture' in html_lower:
-                rotate_result = await self._try_rotating_code_challenge()
-                if rotate_result:
-                    print(f"  rotating_code: completed", flush=True)
-                    await asyncio.sleep(0.2)
-                    html = await self.browser.get_html()
-                    dom_codes = extract_hidden_codes(html)
-                    if dom_codes:
-                        print(f"  post-rotate codes: {dom_codes}", flush=True)
-                        filled = await self._try_fill_code(dom_codes)
-                        if filled:
-                            url = await self.browser.get_url()
-                            if self._check_progress(url, challenge_num):
-                                self.metrics.end_challenge(
-                                    challenge_num, success=True,
-                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
-                                )
-                                print(f"  >>> PASSED <<<", flush=True)
-                                return True
+                # Handle Rotating Code Challenge (click Capture N times to reveal real code)
+                if 'rotating' in html_lower and 'capture' in html_lower:
+                    rotate_result = await self._try_rotating_code_challenge()
+                    if rotate_result:
+                        print(f"  rotating_code: completed", flush=True)
+                        await asyncio.sleep(0.2)
+                        html = await self.browser.get_html()
+                        dom_codes = extract_hidden_codes(html)
+                        if dom_codes:
+                            print(f"  post-rotate codes: {dom_codes}", flush=True)
+                            filled = await self._try_fill_code(dom_codes)
+                            if filled:
+                                url = await self.browser.get_url()
+                                if self._check_progress(url, challenge_num):
+                                    self.metrics.end_challenge(
+                                        challenge_num, success=True,
+                                        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                    )
+                                    print(f"  >>> PASSED <<<", flush=True)
+                                    return True
 
-            # Handle Multi-Tab Challenge (click through tabs to collect code parts)
-            if 'tab' in html_lower and ('puzzle' in html_lower or 'multi' in html_lower or 'visit' in html_lower):
-                tab_result = await self._try_multi_tab_challenge()
-                if tab_result:
-                    print(f"  multi_tab: completed", flush=True)
-                    await asyncio.sleep(0.2)
-                    html = await self.browser.get_html()
-                    dom_codes = extract_hidden_codes(html)
-                    if dom_codes:
-                        print(f"  post-tab codes: {dom_codes}", flush=True)
-                        filled = await self._try_fill_code(dom_codes)
-                        if filled:
-                            url = await self.browser.get_url()
-                            if self._check_progress(url, challenge_num):
-                                self.metrics.end_challenge(
-                                    challenge_num, success=True,
-                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
-                                )
-                                print(f"  >>> PASSED <<<", flush=True)
-                                return True
+                # Handle Multi-Tab Challenge (click through tabs to collect code parts)
+                if 'tab' in html_lower and ('puzzle' in html_lower or 'multi' in html_lower or 'visit' in html_lower):
+                    tab_result = await self._try_multi_tab_challenge()
+                    if tab_result:
+                        print(f"  multi_tab: completed", flush=True)
+                        await asyncio.sleep(0.2)
+                        html = await self.browser.get_html()
+                        dom_codes = extract_hidden_codes(html)
+                        if dom_codes:
+                            print(f"  post-tab codes: {dom_codes}", flush=True)
+                            filled = await self._try_fill_code(dom_codes)
+                            if filled:
+                                url = await self.browser.get_url()
+                                if self._check_progress(url, challenge_num):
+                                    self.metrics.end_challenge(
+                                        challenge_num, success=True,
+                                        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                    )
+                                    print(f"  >>> PASSED <<<", flush=True)
+                                    return True
 
-            # Handle Sequence Challenge (click button N times to progress and reveal code)
-            if 'sequence' in html_lower or ('progress' in html_lower and 'click' in html_lower):
-                seq_result = await self._try_sequence_challenge()
-                if seq_result:
-                    print(f"  sequence_challenge: completed", flush=True)
-                    await asyncio.sleep(0.2)
-                    html = await self.browser.get_html()
-                    dom_codes = extract_hidden_codes(html)
-                    if dom_codes:
-                        print(f"  post-sequence codes: {dom_codes}", flush=True)
-                        filled = await self._try_fill_code(dom_codes)
-                        if filled:
-                            url = await self.browser.get_url()
-                            if self._check_progress(url, challenge_num):
-                                self.metrics.end_challenge(
-                                    challenge_num, success=True,
-                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
-                                )
-                                print(f"  >>> PASSED <<<", flush=True)
-                                return True
+                # Handle Sequence Challenge (click button N times to progress and reveal code)
+                if 'sequence' in html_lower or ('progress' in html_lower and 'click' in html_lower):
+                    seq_result = await self._try_sequence_challenge()
+                    if seq_result:
+                        print(f"  sequence_challenge: completed", flush=True)
+                        await asyncio.sleep(0.2)
+                        html = await self.browser.get_html()
+                        dom_codes = extract_hidden_codes(html)
+                        if dom_codes:
+                            print(f"  post-sequence codes: {dom_codes}", flush=True)
+                            filled = await self._try_fill_code(dom_codes)
+                            if filled:
+                                url = await self.browser.get_url()
+                                if self._check_progress(url, challenge_num):
+                                    self.metrics.end_challenge(
+                                        challenge_num, success=True,
+                                        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                    )
+                                    print(f"  >>> PASSED <<<", flush=True)
+                                    return True
 
-            # Handle Math/Puzzle Challenge (solve expression, type answer, click Solve)
-            if 'puzzle' in html_lower and ('solve' in html_lower or '= ?' in html_lower or '=?' in html_lower):
-                puzzle_result = await self._try_math_puzzle_challenge()
-                if puzzle_result:
-                    print(f"  math_puzzle: completed", flush=True)
-                    await asyncio.sleep(0.2)
-                    html = await self.browser.get_html()
-                    dom_codes = extract_hidden_codes(html)
-                    if dom_codes:
-                        print(f"  post-puzzle codes: {dom_codes}", flush=True)
-                        filled = await self._try_fill_code(dom_codes)
-                        if filled:
-                            url = await self.browser.get_url()
-                            if self._check_progress(url, challenge_num):
-                                self.metrics.end_challenge(
-                                    challenge_num, success=True,
-                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
-                                )
-                                print(f"  >>> PASSED <<<", flush=True)
-                                return True
+                # Handle Math/Puzzle Challenge (solve expression, type answer, click Solve)
+                if 'puzzle' in html_lower and ('solve' in html_lower or '= ?' in html_lower or '=?' in html_lower):
+                    puzzle_revealed = await self._try_math_puzzle_challenge()
+                    if puzzle_revealed:
+                        print(f"  math_puzzle: completed, revealed={puzzle_revealed}", flush=True)
+                        # Solving the puzzle may unlock the Submit button, so codes that
+                        # "failed" before (Submit was locked) should be retried now
+                        if puzzle_revealed in self.failed_codes_this_step:
+                            self.failed_codes_this_step.discard(puzzle_revealed)
+                            print(f"  cleared '{puzzle_revealed}' from failed_codes for retry", flush=True)
+                        await asyncio.sleep(0.2)
+                        html = await self.browser.get_html()
+                        dom_codes = extract_hidden_codes(html)
+                        # Prepend the puzzle-revealed code (it's from visible text,
+                        # extract_hidden_codes may miss it)
+                        if puzzle_revealed not in dom_codes:
+                            dom_codes.insert(0, puzzle_revealed)
+                        if dom_codes:
+                            print(f"  post-puzzle codes: {dom_codes}", flush=True)
+                            filled = await self._try_fill_code(dom_codes)
+                            if filled:
+                                url = await self.browser.get_url()
+                                if self._check_progress(url, challenge_num):
+                                    self.metrics.end_challenge(
+                                        challenge_num, success=True,
+                                        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                    )
+                                    print(f"  >>> PASSED <<<", flush=True)
+                                    return True
 
-            # Handle Video Challenge (seek through frames to find code)
-            if 'video' in html_lower and 'frame' in html_lower and 'seek' in html_lower:
-                video_result = await self._try_video_challenge()
-                if video_result:
-                    print(f"  video_challenge: completed", flush=True)
-                    await asyncio.sleep(0.2)
-                    html = await self.browser.get_html()
-                    dom_codes = extract_hidden_codes(html)
-                    if dom_codes:
-                        print(f"  post-video codes: {dom_codes}", flush=True)
-                        filled = await self._try_fill_code(dom_codes)
-                        if filled:
-                            url = await self.browser.get_url()
-                            if self._check_progress(url, challenge_num):
-                                self.metrics.end_challenge(
-                                    challenge_num, success=True,
-                                    tokens_in=total_tokens_in, tokens_out=total_tokens_out
-                                )
-                                print(f"  >>> PASSED <<<", flush=True)
-                                return True
+                # Handle Video Challenge (seek through frames to find code)
+                if 'video' in html_lower and 'frame' in html_lower and 'seek' in html_lower:
+                    video_result = await self._try_video_challenge()
+                    if video_result:
+                        print(f"  video_challenge: completed", flush=True)
+                        await asyncio.sleep(0.2)
+                        html = await self.browser.get_html()
+                        dom_codes = extract_hidden_codes(html)
+                        if dom_codes:
+                            print(f"  post-video codes: {dom_codes}", flush=True)
+                            filled = await self._try_fill_code(dom_codes)
+                            if filled:
+                                url = await self.browser.get_url()
+                                if self._check_progress(url, challenge_num):
+                                    self.metrics.end_challenge(
+                                        challenge_num, success=True,
+                                        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                                    )
+                                    print(f"  >>> PASSED <<<", flush=True)
+                                    return True
 
             # Scroll page: alternate between bottom and top for scroll challenges
             if attempt % 2 == 0:
@@ -435,22 +459,6 @@ class ChallengeSolver:
             dom_codes = extract_hidden_codes(html)
             if dom_codes:
                 print(f"  dom_codes: {dom_codes}", flush=True)
-
-                # Stale code recovery: if ALL codes were tried and failed on this step,
-                # the React SPA may have retained old component state. Reset via back/forward.
-                all_failed = all(c in self.failed_codes_this_step for c in dom_codes)
-                if all_failed and not stale_recovery_done and len(self.failed_codes_this_step) > 0:
-                    print(f"  -> all {len(dom_codes)} codes failed this step, resetting React state...", flush=True)
-                    stale_recovery_done = True
-                    try:
-                        await self.browser.page.go_back(wait_until='domcontentloaded', timeout=2000)
-                        await asyncio.sleep(0.1)
-                        await self.browser.page.go_forward(wait_until='domcontentloaded', timeout=2000)
-                        await asyncio.sleep(0.3)
-                    except Exception:
-                        pass
-                    continue  # Retry with fresh React state
-
                 filled = await self._try_fill_code(dom_codes)
                 print(f"  filled: {filled}", flush=True)
             else:
@@ -461,23 +469,64 @@ class ChallengeSolver:
                     await asyncio.sleep(1)
                     continue
 
-            # Use AI vision agent earlier and more aggressively when stuck
-            # Trigger at attempt 3, then every 3 attempts (3, 6, 9, 12...)
-            if attempt >= 3 and attempt % 3 == 0:
-                vision_call_num = (attempt - 3) // 3
+            # Brute-force trap buttons when stuck: all codes tried but none worked
+            # On some challenges, the real navigation IS a "trap" button (proceed, continue, etc.)
+            # The code may be correct but the normal Submit is wrong — re-fill code before each trap click
+            # Run every 3rd attempt (3, 6, 9, ...) since scroll may reveal new buttons each time
+            if attempt >= 3 and attempt % 3 == 0 and len(self.failed_codes_this_step) > 0:
+                all_codes_failed = not dom_codes or all(c in self.failed_codes_this_step for c in dom_codes)
+                if all_codes_failed:
+                    # Gather ALL codes: dom_codes + failed_codes (they failed with Submit,
+                    # but may work with the right trap button)
+                    all_codes = list(dict.fromkeys(dom_codes + list(self.failed_codes_this_step)))
+                    trap_result = await self._try_brute_force_trap_buttons(challenge_num, all_codes)
+                    if trap_result:
+                        self.metrics.end_challenge(
+                            challenge_num, success=True,
+                            tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                        )
+                        print(f"  >>> PASSED <<<", flush=True)
+                        return True
+
+            # AI vision: call on attempt 1+, every attempt when stuck
+            # Attempt 0 is fast-path DOM-only (no AI cost)
+            if attempt >= 1:
+                vision_call_num = attempt - 1
                 print(f"  vision (call #{vision_call_num})...", flush=True)
                 screenshot = await self.browser.screenshot()
+                html_for_vision = await self.browser.get_html()
                 action, tin, tout = self.vision.analyze_page(
-                    screenshot, html[:5000], challenge_num, dom_codes,
-                    attempt=vision_call_num
+                    screenshot, html_for_vision[:5000], challenge_num, dom_codes,
+                    attempt=vision_call_num,
+                    failed_codes=list(self.failed_codes_this_step)
                 )
                 total_tokens_in += tin
                 total_tokens_out += tout
                 print(f"  vision: {action.action_type} -> {action.target_selector}", flush=True)
                 if action.code_found:
                     print(f"  vision_code: {action.code_found}", flush=True)
-                    await self._try_fill_code([action.code_found])
+                    filled = await self._try_fill_code([action.code_found])
+                    if filled:
+                        await asyncio.sleep(0.3)
+                        url = await self.browser.get_url()
+                        if self._check_progress(url, challenge_num):
+                            self.metrics.end_challenge(
+                                challenge_num, success=True,
+                                tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                            )
+                            print(f"  >>> PASSED <<<", flush=True)
+                            return True
                 await self._execute_action(action)
+                # Check if vision action caused progress
+                await asyncio.sleep(0.3)
+                url = await self.browser.get_url()
+                if self._check_progress(url, challenge_num):
+                    self.metrics.end_challenge(
+                        challenge_num, success=True,
+                        tokens_in=total_tokens_in, tokens_out=total_tokens_out
+                    )
+                    print(f"  >>> PASSED <<<", flush=True)
+                    return True
 
             await asyncio.sleep(0.1)
 
@@ -487,7 +536,7 @@ class ChallengeSolver:
         """Handle special challenge patterns: modals, click-to-reveal, overlays, fake popups."""
         return await self.browser.page.evaluate("""
             () => {
-                const result = {handled: false, modal_closed: false, reveal_clicked: 0, popups_removed: 0, modal_scrolled: false, has_timer: false, timer_seconds: 0};
+                const result = {handled: false, modal_closed: false, has_radio_modal: false, reveal_clicked: 0, popups_removed: 0, modal_scrolled: false, has_timer: false, timer_seconds: 0};
 
                 // 0. Handle popups with fake/real close buttons
                 // React needs DOM nodes intact for reconciliation during route transitions.
@@ -543,15 +592,22 @@ class ChallengeSolver:
                     }
                 });
 
-                // 1. Handle scrollable modals - scroll to TOP to reveal radio options
-                // Radio options are typically at the top, with filler text below
+                // 1. Handle scrollable modals - scroll to reveal content
+                // If container has radio inputs, scroll to BOTTOM (radios are after filler text)
+                // Otherwise scroll to top
                 const scrollContainers = document.querySelectorAll(
-                    '[class*="overflow-y"], [class*="overflow-auto"], [style*="overflow"]'
+                    '[class*="overflow-y"], [class*="overflow-auto"], [style*="overflow"], [class*="max-h"]'
                 );
                 scrollContainers.forEach(modal => {
                     if (modal.scrollHeight > modal.clientHeight) {
-                        // Scroll to top first to reveal radio options
-                        modal.scrollTop = 0;
+                        const hasRadios = modal.querySelector('input[type="radio"]') ||
+                            modal.closest('[role="dialog"], .fixed')?.querySelector('input[type="radio"]');
+                        if (hasRadios) {
+                            // Scroll to bottom - radios are after filler text ("Scroll down to see all options")
+                            modal.scrollTop = modal.scrollHeight;
+                        } else {
+                            modal.scrollTop = 0;
+                        }
                         result.modal_scrolled = true;
                         result.handled = true;
                     }
@@ -625,37 +681,16 @@ class ChallengeSolver:
                     }
                 });
 
-                // 2a2. HIDE radio modal overlays - they're decoys, real code comes from hover/main challenge
-                // Try React-compatible nativeSetter before hiding, in case one option does work
-                document.querySelectorAll('.fixed').forEach(el => {
-                    const radios = el.querySelectorAll('input[type="radio"]');
-                    const hasSubmit = [...el.querySelectorAll('button')].some(b => b.textContent.includes('Submit'));
-                    if (radios.length > 0 && hasSubmit) {
-                        // Try nativeSetter on "correct" option for React compatibility
-                        for (const radio of radios) {
-                            const label = (radio.closest('[class*="border"]') || radio.closest('div'))?.textContent || '';
-                            const t = label.toLowerCase();
-                            if (t.includes('correct') && t.includes('option')) {
-                                try {
-                                    const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked').set;
-                                    s.call(radio, true);
-                                    radio.dispatchEvent(new Event('change', {bubbles: true}));
-                                    radio.dispatchEvent(new Event('input', {bubbles: true}));
-                                } catch(e) {}
-                                break;
-                            }
-                        }
-                        // Click Submit one final time
-                        el.querySelectorAll('button').forEach(btn => {
-                            if (btn.textContent.includes('Submit')) btn.click();
-                        });
-                        // Hide modal to unblock hover/main challenge underneath
-                        hideElement(el);
-                        result.modal_closed = true;
-                        result.popups_removed++;
-                        result.handled = true;
-                    }
-                });
+                // 2a2. Detect radio modal presence (native radios, role-based, OR text-based)
+                // Custom radio components may use divs/buttons instead of input[type="radio"]
+                const hasNativeRadios = document.querySelectorAll('input[type="radio"]').length > 0;
+                const hasRoleRadios = document.querySelectorAll('[role="radio"]').length > 0;
+                const bodyText = (document.body?.textContent || '').toLowerCase();
+                const hasRadioText = bodyText.includes('please select an option') && bodyText.includes('submit & continue');
+                if (hasNativeRadios || hasRoleRadios || hasRadioText) {
+                    result.has_radio_modal = true;
+                    result.handled = true;
+                }
 
                 // 2b. Handle "Modal Dialog" popups with REAL close buttons
                 // These say "Click the button to dismiss" - the Close button actually works
@@ -721,7 +756,8 @@ class ChallengeSolver:
                     if (el.classList.contains('bg-black/70') ||
                         el.style.backgroundColor?.includes('rgba(0, 0, 0')) {
                         if (!el.textContent.includes('Cookie') &&
-                            !el.textContent.includes('Step')) {
+                            !el.textContent.includes('Step') &&
+                            !el.querySelector('input[type="radio"]')) {
                             el.style.pointerEvents = 'none';
                             result.handled = true;
                         }
@@ -1605,8 +1641,9 @@ class ChallengeSolver:
             print(f"    -> sequence error: {e}", flush=True)
             return False
 
-    async def _try_math_puzzle_challenge(self) -> bool:
-        """Handle Math/Puzzle Challenge - solve expression, type answer, click Solve."""
+    async def _try_math_puzzle_challenge(self) -> str | None:
+        """Handle Math/Puzzle Challenge - solve expression, type answer, click Solve.
+        Returns the revealed code string if found, or None."""
         try:
             # Step 1: Parse the math expression
             expr = await self.browser.page.evaluate("""
@@ -1724,10 +1761,28 @@ class ChallengeSolver:
                             continue
 
             await asyncio.sleep(1.0)
-            return True
+
+            # Extract the revealed code from visible page text
+            # The puzzle reveals a code like "Code revealed: VXLFZS" in visible text
+            # which extract_hidden_codes() would miss since it only looks at hidden elements
+            revealed_code = await self.browser.page.evaluate("""
+                () => {
+                    const text = document.body.textContent || '';
+                    // Look for "Code revealed: XXXXXX" or "code: XXXXXX" patterns
+                    const m = text.match(/[Cc]ode\\s*(?:revealed|is)?\\s*:?\\s*([A-Z0-9]{6})/);
+                    if (m) return m[1];
+                    // Also try to find any standalone 6-char alphanumeric near "revealed"/"solved"
+                    const m2 = text.match(/(?:revealed|solved)[^A-Z0-9]*([A-Z0-9]{6})/i);
+                    if (m2) return m2[1].toUpperCase();
+                    return null;
+                }
+            """)
+            if revealed_code:
+                print(f"    -> puzzle revealed code: {revealed_code}", flush=True)
+            return revealed_code
         except Exception as e:
             print(f"    -> math puzzle error: {e}", flush=True)
-            return False
+            return None
 
     async def _try_audio_challenge(self) -> bool:
         """Handle Audio Challenge - intercept SpeechSynthesis/Audio/network, force-end speech."""
@@ -2483,6 +2538,304 @@ class ChallengeSolver:
             }
         """)
 
+
+    async def _try_brute_force_radio(self, challenge_num: int) -> bool:
+        """Brute-force ALL radio/option elements (native + custom components).
+        Tries each option + Submit, checks URL. If none work, hides the modal."""
+        try:
+            # First scroll any scrollable containers to bottom to reveal radio options
+            await self.browser.page.evaluate("""
+                () => {
+                    document.querySelectorAll('[class*="overflow-y"], [class*="overflow-auto"], [style*="overflow"], [class*="max-h"]').forEach(el => {
+                        if (el.scrollHeight > el.clientHeight) {
+                            el.scrollTop = el.scrollHeight;
+                        }
+                    });
+                }
+            """)
+            await asyncio.sleep(0.2)
+
+            # Find option count (native radios, role-based, or custom option cards)
+            count = await self.browser.page.evaluate("""
+                () => {
+                    // Strategy 1: Native radio inputs
+                    const native = document.querySelectorAll('input[type="radio"]');
+                    if (native.length > 0) return native.length;
+                    // Strategy 2: Role-based radios
+                    const role = document.querySelectorAll('[role="radio"]');
+                    if (role.length > 0) return role.length;
+                    // Strategy 3: Custom option cards near Submit button
+                    const submitBtn = [...document.querySelectorAll('button')].find(b =>
+                        b.textContent.includes('Submit & Continue') || b.textContent.includes('Submit and Continue'));
+                    if (!submitBtn) return 0;
+                    // Walk up from Submit to find the modal container
+                    let modal = submitBtn.parentElement;
+                    while (modal && modal !== document.body) {
+                        if (modal.querySelector('[class*="overflow"]') || modal.querySelector('[class*="max-h"]')) break;
+                        modal = modal.parentElement;
+                    }
+                    if (!modal || modal === document.body) modal = submitBtn.closest('div[class*="bg-white"], div[class*="rounded"]');
+                    if (!modal) return 0;
+                    // Find clickable option cards (bordered, short text, not sections/headings)
+                    const cards = [...modal.querySelectorAll('[class*="cursor-pointer"], [class*="border"][class*="rounded"]')].filter(el => {
+                        const text = el.textContent.trim();
+                        return text.length > 0 && text.length < 80 &&
+                            !text.includes('Submit') && !text.includes('Section') &&
+                            !text.includes('lorem ipsum') && !text.includes('Introduction');
+                    });
+                    return cards.length;
+                }
+            """)
+
+            if count == 0:
+                return False
+
+            print(f"    [brute-radio] trying all {count} options...", flush=True)
+
+            for i in range(count):
+                try:
+                    # Re-find options each iteration (React may re-render after wrong selection)
+                    # Click option i, then Submit
+                    clicked = await self.browser.page.evaluate("""(idx) => {
+                        // Find all option elements (re-find to handle React re-renders)
+                        let options = [...document.querySelectorAll('input[type="radio"]')];
+                        if (options.length === 0) options = [...document.querySelectorAll('[role="radio"]')];
+                        if (options.length === 0) {
+                            // Custom option cards
+                            const submitBtn = [...document.querySelectorAll('button')].find(b =>
+                                b.textContent.includes('Submit & Continue') || b.textContent.includes('Submit and Continue'));
+                            if (!submitBtn) return false;
+                            let modal = submitBtn.parentElement;
+                            while (modal && modal !== document.body) {
+                                if (modal.querySelector('[class*="overflow"]') || modal.querySelector('[class*="max-h"]')) break;
+                                modal = modal.parentElement;
+                            }
+                            if (!modal || modal === document.body) modal = submitBtn.closest('div[class*="bg-white"], div[class*="rounded"]');
+                            if (!modal) return false;
+                            options = [...modal.querySelectorAll('[class*="cursor-pointer"], [class*="border"][class*="rounded"]')].filter(el => {
+                                const text = el.textContent.trim();
+                                return text.length > 0 && text.length < 80 &&
+                                    !text.includes('Submit') && !text.includes('Section') &&
+                                    !text.includes('lorem ipsum') && !text.includes('Introduction');
+                            });
+                        }
+                        const opt = options[idx];
+                        if (!opt) return false;
+
+                        // Click the option
+                        opt.click();
+
+                        // If native radio, also use nativeSetter for React compatibility
+                        if (opt.type === 'radio') {
+                            try {
+                                const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked').set;
+                                s.call(opt, true);
+                                opt.dispatchEvent(new Event('change', {bubbles: true}));
+                                opt.dispatchEvent(new Event('input', {bubbles: true}));
+                            } catch(e) {}
+                        }
+
+                        // Also click parent card (for custom components)
+                        const card = opt.closest('label, [class*="cursor-pointer"]');
+                        if (card && card !== opt) card.click();
+
+                        // Click Submit button
+                        const btns = [...document.querySelectorAll('button')];
+                        const sub = btns.find(b => b.textContent.includes('Submit'));
+                        if (sub) sub.click();
+                        return true;
+                    }""", i)
+
+                    if not clicked:
+                        continue
+
+                    await asyncio.sleep(0.1)
+                    url_after = await self.browser.get_url()
+                    if self._check_progress(url_after, challenge_num):
+                        print(f"    [brute-radio] option {i+1}/{count} CORRECT!", flush=True)
+                        return True
+                    print(f"    [brute-radio] option {i+1} wrong", flush=True)
+                except Exception as e:
+                    print(f"    [brute-radio] option {i+1} error: {e}", flush=True)
+                    continue
+
+            # All options wrong - hide modal permanently
+            print(f"    [brute-radio] all {count} wrong, hiding modal", flush=True)
+            await self._inject_modal_hide_css()
+            return False
+
+        except Exception as e:
+            print(f"    [brute-radio] error: {e}", flush=True)
+            return False
+
+    async def _try_brute_force_trap_buttons(self, challenge_num: int, codes: list[str] | str | None = None) -> bool:
+        """When stuck, try clicking 'trap' navigation buttons one by one.
+        On some challenges, the real navigation IS one of the trap buttons
+        (proceed, continue, next step, etc.) that we normally skip.
+        Finds ALL matching buttons in the DOM (including off-screen ones behind
+        100 filler sections) and scrolls each into view before clicking.
+        Tries each code with each button, re-filling before every click."""
+        try:
+            # Normalize codes to a list
+            if isinstance(codes, str):
+                codes = [codes]
+            elif codes is None:
+                codes = []
+
+            # Also try "Submit Code" button which _try_fill_code skips if it looks like a trap
+            # Include it in our trap word search
+            TRAP_WORDS_JS = """['proceed', 'continue', 'next step', 'next page',
+                        'next section', 'move on', 'go forward', 'keep going', 'advance',
+                        'continue journey', 'click here', 'proceed forward', 'continue reading',
+                        'next', 'go', 'submit code', 'submit']"""
+
+            # Get ALL matching buttons in DOM — do NOT filter by visibility.
+            count = await self.browser.page.evaluate(f"""
+                () => {{
+                    const TRAP_WORDS = {TRAP_WORDS_JS};
+                    const btns = [...document.querySelectorAll('button, a')];
+                    return btns.filter(el => {{
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        return t.length < 40 && TRAP_WORDS.some(w => t === w || t.includes(w));
+                    }}).length;
+                }}
+            """)
+
+            if count == 0:
+                return False
+
+            print(f"    [brute-trap] found {count} buttons, trying {len(codes)} codes: {codes}...", flush=True)
+
+            # Outer loop: codes. Inner loop: buttons.
+            # If a code is wrong, no button will work; if it's right, one button will.
+            for code in codes:
+                print(f"    [brute-trap] trying code '{code}' with {count} buttons...", flush=True)
+                for i in range(count):
+                    # Re-fill the code before each click — button clicks reset the input
+                    await self.browser.page.evaluate(f"""(code) => {{
+                        const input = document.querySelector('input[placeholder*="code" i], input[placeholder*="Code"], input[type="text"]');
+                        if (input) {{
+                            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value').set;
+                            nativeInputValueSetter.call(input, code);
+                            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        }}
+                    }}""", code)
+                    await asyncio.sleep(0.1)
+
+                    # Scroll button into view
+                    clicked_text = await self.browser.page.evaluate(f"""(idx) => {{
+                        const TRAP_WORDS = {TRAP_WORDS_JS};
+                        const btns = [...document.querySelectorAll('button, a')].filter(el => {{
+                            const t = (el.textContent || '').trim().toLowerCase();
+                            return t.length < 40 && TRAP_WORDS.some(w => t === w || t.includes(w));
+                        }});
+                        const btn = btns[idx];
+                        if (!btn) return null;
+                        btn.scrollIntoView({{behavior: 'instant', block: 'center'}});
+                        return (btn.textContent || '').trim().substring(0, 30);
+                    }}""", i)
+
+                    if not clicked_text:
+                        continue
+
+                    await asyncio.sleep(0.15)
+
+                    # Click the button
+                    await self.browser.page.evaluate(f"""(idx) => {{
+                        const TRAP_WORDS = {TRAP_WORDS_JS};
+                        const btns = [...document.querySelectorAll('button, a')].filter(el => {{
+                            const t = (el.textContent || '').trim().toLowerCase();
+                            return t.length < 40 && TRAP_WORDS.some(w => t === w || t.includes(w));
+                        }});
+                        const btn = btns[idx];
+                        if (btn) btn.click();
+                    }}""", i)
+
+                    await asyncio.sleep(0.3)
+                    url_after = await self.browser.get_url()
+                    if self._check_progress(url_after, challenge_num):
+                        print(f"    [brute-trap] button '{clicked_text}' with code '{code}' CORRECT!", flush=True)
+                        return True
+                    print(f"    [brute-trap] '{clicked_text}' + '{code}' wrong", flush=True)
+
+            # Also try each button WITHOUT any code (some challenges just need the right button click)
+            print(f"    [brute-trap] trying {count} buttons without code...", flush=True)
+            for i in range(count):
+                clicked_text = await self.browser.page.evaluate(f"""(idx) => {{
+                    const TRAP_WORDS = {TRAP_WORDS_JS};
+                    const btns = [...document.querySelectorAll('button, a')].filter(el => {{
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        return t.length < 40 && TRAP_WORDS.some(w => t === w || t.includes(w));
+                    }});
+                    const btn = btns[idx];
+                    if (!btn) return null;
+                    btn.scrollIntoView({{behavior: 'instant', block: 'center'}});
+                    return (btn.textContent || '').trim().substring(0, 30);
+                }}""", i)
+                if not clicked_text:
+                    continue
+                await asyncio.sleep(0.15)
+                await self.browser.page.evaluate(f"""(idx) => {{
+                    const TRAP_WORDS = {TRAP_WORDS_JS};
+                    const btns = [...document.querySelectorAll('button, a')].filter(el => {{
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        return t.length < 40 && TRAP_WORDS.some(w => t === w || t.includes(w));
+                    }});
+                    const btn = btns[idx];
+                    if (btn) btn.click();
+                }}""", i)
+                await asyncio.sleep(0.3)
+                url_after = await self.browser.get_url()
+                if self._check_progress(url_after, challenge_num):
+                    print(f"    [brute-trap] button '{clicked_text}' (no code) CORRECT!", flush=True)
+                    return True
+
+            return False
+        except Exception as e:
+            print(f"    [brute-trap] error: {e}", flush=True)
+            return False
+
+    async def _inject_modal_hide_css(self):
+        """Permanently hide radio modals using CSS + MutationObserver.
+        Handles both native radios and custom components. Survives React re-renders."""
+        await self.browser.page.evaluate("""
+            () => {
+                if (window.__radioModalHider) return;
+                // CSS for native radio modals
+                const style = document.createElement('style');
+                style.id = 'hide-radio-modal';
+                style.textContent = `
+                    .fixed:has(input[type="radio"]),
+                    .fixed:has([role="radio"]) {
+                        display: none !important;
+                        visibility: hidden !important;
+                        pointer-events: none !important;
+                    }
+                `;
+                document.head.appendChild(style);
+
+                // Direct hide + MutationObserver for custom radio modals
+                const hideRadioModals = () => {
+                    document.querySelectorAll('.fixed, [role="dialog"], div[class*="bg-white"][class*="shadow"]').forEach(el => {
+                        const text = (el.textContent || '').toLowerCase();
+                        if (text.includes('please select an option') && text.includes('submit & continue')) {
+                            el.style.cssText = 'display:none!important;visibility:hidden!important;pointer-events:none!important;';
+                        }
+                    });
+                };
+                hideRadioModals();
+                // Re-hide on any DOM change (React re-renders)
+                let pending = false;
+                window.__radioModalHider = new MutationObserver(() => {
+                    if (pending) return;
+                    pending = true;
+                    requestAnimationFrame(() => { hideRadioModals(); pending = false; });
+                });
+                window.__radioModalHider.observe(document.body, {childList: true, subtree: true});
+            }
+        """)
 
     async def _try_radio_selection(self) -> bool:
         """Try to select correct radio option using Playwright native clicks.
