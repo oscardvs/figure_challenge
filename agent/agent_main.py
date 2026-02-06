@@ -3,6 +3,7 @@ import asyncio
 import argparse
 import json
 import sys
+import signal
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -13,7 +14,7 @@ from agent_solver import AgentChallengeSolver
 from config import GEMINI_API_KEY, CHALLENGE_URL, MAX_TIME_SECONDS
 
 
-async def main(headless: bool = False):
+async def main(headless: bool = False, keep_open: bool = False):
     if not GEMINI_API_KEY:
         print("ERROR: Set GEMINI_API_KEY environment variable")
         sys.exit(1)
@@ -22,9 +23,11 @@ async def main(headless: bool = False):
     print(f"Target: {CHALLENGE_URL}")
     print(f"Time limit: {MAX_TIME_SECONDS}s")
     print(f"Headless: {headless}")
+    print(f"Keep browser open: {keep_open}")
     print("-" * 50)
 
     solver = AgentChallengeSolver(GEMINI_API_KEY)
+    solver.keep_browser_open = keep_open
 
     try:
         results = await asyncio.wait_for(
@@ -34,6 +37,22 @@ async def main(headless: bool = False):
     except asyncio.TimeoutError:
         print(f"\nTIMEOUT: Exceeded {MAX_TIME_SECONDS}s limit")
         results = solver.metrics.get_summary()
+        solver.metrics.print_summary()
+
+        if keep_open:
+            print("\n" + "="*60)
+            print("  BROWSER LEFT OPEN FOR DEBUGGING")
+            print("  Press Enter to close browser and exit...")
+            print("="*60 + "\n")
+            try:
+                await asyncio.get_event_loop().run_in_executor(None, input)
+            except (EOFError, KeyboardInterrupt):
+                pass
+            finally:
+                try:
+                    await solver.browser.stop()
+                except Exception:
+                    pass
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_file = f"agent_results_{timestamp}.json"
@@ -49,5 +68,6 @@ if __name__ == "__main__":
     load_dotenv()
     parser = argparse.ArgumentParser(description="Agent-Based Browser Challenge Solver")
     parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
+    parser.add_argument("--keep-open", action="store_true", help="Keep browser open after timeout for debugging")
     args = parser.parse_args()
-    asyncio.run(main(headless=args.headless))
+    asyncio.run(main(headless=args.headless, keep_open=args.keep_open))

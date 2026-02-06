@@ -23,6 +23,7 @@ class AgentChallengeSolver:
         self.vision = AgentVision(api_key)
         self.metrics = MetricsTracker()
         self.current_step = 0
+        self.keep_browser_open = False
 
     async def run(self, start_url: str, headless: bool = False) -> dict:
         """Run through all 30 challenges."""
@@ -35,6 +36,7 @@ class AgentChallengeSolver:
             await asyncio.sleep(1)
 
             run_start = time.time()
+            self.run_start = run_start
             for step in range(1, 31):
                 self.current_step = step
                 self.metrics.start_challenge(step)
@@ -43,6 +45,12 @@ class AgentChallengeSolver:
                 print(f"\n{'='*60}", flush=True)
                 print(f"  STEP {step}/30  (elapsed: {elapsed:.1f}s)", flush=True)
                 print(f"{'='*60}", flush=True)
+
+                # Soft timeout: stop starting new steps after 295s
+                if elapsed > 295:
+                    print(f"  SOFT TIMEOUT: {elapsed:.0f}s elapsed, stopping step loop", flush=True)
+                    self.metrics.end_challenge(step, success=False, error="Soft timeout")
+                    break
 
                 success = await self._solve_step(step)
 
@@ -53,8 +61,12 @@ class AgentChallengeSolver:
                 if not success:
                     self.metrics.end_challenge(step, success=False, error="Max attempts reached")
         finally:
-            await self.browser.stop()
             self.metrics.print_summary()
+            if not self.keep_browser_open:
+                await self.browser.stop()
+            else:
+                print("\n[KEEP-OPEN] Browser left open for manual debugging.", flush=True)
+                print("[KEEP-OPEN] Press Ctrl+C to close.", flush=True)
 
         return self.metrics.get_summary()
 
@@ -65,11 +77,18 @@ class AgentChallengeSolver:
         failed_codes: list[str] = []
         action_history: list[str] = []
         max_attempts = 15
+        scroll_attempted = False  # Prevent running scroll-to-find multiple times per step
 
         # Wait for React to render
         await self._wait_for_content()
 
         for attempt in range(max_attempts):
+            # Global time budget check - leave 5s buffer for cleanup
+            global_elapsed = time.time() - getattr(self, 'run_start', time.time())
+            if global_elapsed > 290:
+                print(f"  TIMEOUT RISK: {global_elapsed:.0f}s elapsed, skipping remaining attempts", flush=True)
+                break
+
             # 1. Check if already progressed
             url = await self.browser.get_url()
             if self._check_progress(url, step):
@@ -168,13 +187,26 @@ class AgentChallengeSolver:
 
                 # Handle math puzzles
                 if 'puzzle' in html_text.lower() and ('= ?' in html_text or '=?' in html_text):
-                    math_code = await self._try_math_puzzle()
+                    math_code = await self._try_math_puzzle(failed_codes)
                     if math_code and math_code not in failed_codes:
                         if await self._fill_and_submit(math_code, step):
                             self.metrics.end_challenge(step, True, total_tin, total_tout)
                             print(f"  >>> PASSED <<<", flush=True)
                             return True
                         failed_codes.append(math_code)
+                    # Even if math code was stale, solving puzzle may have unlocked something
+                    # Try deep extraction after puzzle solve (React state may have changed)
+                    post_math_codes = await self._deep_code_extraction(failed_codes)
+                    if post_math_codes:
+                        print(f"  Post-math deep codes: {post_math_codes[:5]}", flush=True)
+                        for code in post_math_codes[:5]:
+                            if code in failed_codes:
+                                continue
+                            if await self._fill_and_submit(code, step):
+                                self.metrics.end_challenge(step, True, total_tin, total_tout)
+                                print(f"  >>> PASSED (post-math deep) <<<", flush=True)
+                                return True
+                            failed_codes.append(code)
 
                 # Handle timing/capture challenges
                 if 'capture' in html_text.lower() and ('timing' in html_text.lower() or 'second' in html_text.lower()):
@@ -313,7 +345,8 @@ class AgentChallengeSolver:
                     }
                     return false;
                 }""")
-                if is_scroll_challenge:
+                if is_scroll_challenge and not scroll_attempted:
+                    scroll_attempted = True
                     all_codes = list(codes) + list(failed_codes) if codes else list(failed_codes)
                     if await self._try_scroll_to_find_nav(all_codes):
                         url = await self.browser.get_url()
@@ -426,7 +459,8 @@ class AgentChallengeSolver:
                             return t.length < 40 && TRAPS.some(w => t.includes(w));
                         }).length;
                     }""")
-                    if trap_count >= 8:
+                    if trap_count >= 8 and not scroll_attempted:
+                        scroll_attempted = True
                         print(f"  {trap_count} trap buttons detected, trying scroll-to-find...", flush=True)
                         # Many trap buttons strongly suggests a scroll-to-find challenge
                         if await self._try_scroll_to_find_nav(list(failed_codes), deep_scroll=True):
@@ -553,7 +587,8 @@ class AgentChallengeSolver:
                     }
                     return false;
                 }""")
-                if is_scroll_ch:
+                if is_scroll_ch and not scroll_attempted:
+                    scroll_attempted = True
                     if await self._try_scroll_to_find_nav(list(failed_codes)):
                         url = await self.browser.get_url()
                         if self._check_progress(url, step):
@@ -1120,8 +1155,9 @@ class AgentChallengeSolver:
 
         return False
 
-    async def _try_math_puzzle(self) -> str | None:
+    async def _try_math_puzzle(self, failed_codes: list[str] | None = None) -> str | None:
         """Solve math expression, type answer, click Solve. Returns revealed code if found."""
+        known_bad = set(failed_codes or [])
         expr = await self.browser.page.evaluate("""() => {
             const text = document.body.textContent || '';
             const m = text.match(/(\\d+)\\s*([+\\-*×÷\\/])\\s*(\\d+)\\s*=\\s*\\?/);
@@ -1146,71 +1182,109 @@ class AgentChallengeSolver:
             const codes = text.match(/\\b[A-Z0-9]{6}\\b/g) || [];
             return [...new Set(codes)];
         }"""))
-        await self.browser.page.evaluate(f"""() => {{
-            const input = document.querySelector('input[type="number"]') ||
-                          document.querySelector('input[inputmode="numeric"]');
-            if (input) {{
-                const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-                s.call(input, '{expr}');
-                input.dispatchEvent(new Event('input', {{bubbles: true}}));
-                input.dispatchEvent(new Event('change', {{bubbles: true}}));
-                input.focus();
+
+        # Try multiple input selectors (some puzzles use type="text" not "number")
+        # First: JS setter approach (works with many React components)
+        filled_js = await self.browser.page.evaluate(f"""() => {{
+            const selectors = [
+                'input[type="number"]',
+                'input[inputmode="numeric"]',
+                'input[placeholder*="answer" i]',
+                'input[placeholder*="solution" i]',
+                'input[type="text"]:not([placeholder*="code" i])'
+            ];
+            for (const sel of selectors) {{
+                const input = document.querySelector(sel);
+                if (input && input.offsetParent) {{
+                    const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                    s.call(input, '{expr}');
+                    input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    input.focus();
+                    return sel;
+                }}
             }}
+            return null;
         }}""")
+        # Backup: Playwright native fill (triggers all browser events properly)
+        if not filled_js:
+            for sel in ['input[type="number"]', 'input[inputmode="numeric"]',
+                        'input[placeholder*="answer" i]', 'input[placeholder*="solution" i]']:
+                try:
+                    loc = self.browser.page.locator(sel).first
+                    if await loc.count() > 0:
+                        await loc.fill(expr)
+                        filled_js = sel
+                        break
+                except Exception:
+                    continue
         await asyncio.sleep(0.2)
         await self.browser.page.keyboard.press("Enter")
         await asyncio.sleep(0.5)
-        # Also click Solve button
-        await self.browser.page.evaluate("""() => {
-            const btns = [...document.querySelectorAll('button')];
-            for (const btn of btns) {
-                const t = (btn.textContent || '').trim().toLowerCase();
-                if ((t === 'solve' || t.includes('check') || t.includes('verify') || t === 'submit') && !btn.disabled) {
-                    btn.click(); return;
+
+        # Click Solve/Check/Verify button (try multiple times with increasing wait)
+        for solve_attempt in range(3):
+            clicked = await self.browser.page.evaluate("""() => {
+                const btns = [...document.querySelectorAll('button')];
+                for (const btn of btns) {
+                    const t = (btn.textContent || '').trim().toLowerCase();
+                    if ((t === 'solve' || t.includes('check') || t.includes('verify') || t === 'submit') && !btn.disabled) {
+                        btn.click(); return true;
+                    }
                 }
-            }
-        }""")
-        await asyncio.sleep(1.0)
+                return false;
+            }""")
+            await asyncio.sleep(0.8)
 
-        # Collect codes AFTER solving and find new ones via delta
-        codes_after = set(await self.browser.page.evaluate("""() => {
-            const text = document.body.textContent || '';
-            const codes = text.match(/\\b[A-Z0-9]{6}\\b/g) || [];
-            return [...new Set(codes)];
-        }"""))
-        new_codes = codes_after - codes_before
-        # Filter out common Latin/lorem ipsum false positives
-        LATIN = {'BEATAE','LABORE','DOLORE','VENIAM','NOSTRU','ALIQUA','EXERCI',
-                 'TEMPOR','INCIDI','LABORI','MAGNAM','VOLUPT','SAPIEN','FUGIAT',
-                 'COMMOD','EXCEPT','OFFICI','MOLLIT','PROIDE','REPUDI'}
-        new_codes = {c for c in new_codes if c not in LATIN}
-        if new_codes:
-            code = next(iter(new_codes))
-            print(f"  Math puzzle delta code: {code} (new: {new_codes})", flush=True)
-            return code
+            # Check delta after each attempt
+            codes_after = set(await self.browser.page.evaluate("""() => {
+                const text = document.body.textContent || '';
+                const codes = text.match(/\\b[A-Z0-9]{6}\\b/g) || [];
+                return [...new Set(codes)];
+            }"""))
+            new_codes = codes_after - codes_before
+            # Filter out false positives AND already-failed codes
+            from dom_parser import FALSE_POSITIVES
+            new_codes = {c for c in new_codes if c not in FALSE_POSITIVES and c not in known_bad}
+            if new_codes:
+                # Prefer mixed alpha+digit codes
+                sorted_new = self._sort_codes_by_priority(new_codes)
+                code = sorted_new[0]
+                print(f"  Math puzzle delta code: {code} (new: {sorted_new})", flush=True)
+                return code
 
-        # Fallback: pattern-based extraction
+        # Fallback: pattern-based extraction (filter out already-failed codes)
         puzzle_code = await self.browser.page.evaluate("""() => {
             const text = document.body.textContent || '';
             const patterns = [
                 /(?:code(?:\\s+is)?|revealed?)\\s*[:=]\\s*([A-Z0-9]{6})/i,
+                /(?:solved|correct|success)[^.]*?\\b([A-Z0-9]{6})\\b/i,
                 /\\b([A-Z0-9]{6})\\b(?=[^A-Z0-9]*(?:submit|enter|type|input))/i
             ];
+            const results = [];
             for (const p of patterns) {
                 const m = text.match(p);
-                if (m) return m[1].toUpperCase();
+                if (m) results.push(m[1].toUpperCase());
             }
             const successEls = document.querySelectorAll('.text-green-600, .text-green-500, .bg-green-100, .bg-green-50, .text-emerald-600');
             for (const el of successEls) {
                 const t = (el.textContent || '').trim();
                 const m = t.match(/\\b([A-Z0-9]{6})\\b/);
-                if (m) return m[1];
+                if (m) results.push(m[1]);
             }
-            return null;
+            return [...new Set(results)];
         }""")
         if puzzle_code:
-            print(f"  Math puzzle pattern code: {puzzle_code}", flush=True)
-            return puzzle_code
+            from dom_parser import FALSE_POSITIVES
+            # Filter out false positives AND already-failed codes
+            fresh = [c for c in puzzle_code if c not in known_bad and c not in FALSE_POSITIVES]
+            if fresh:
+                sorted_fresh = self._sort_codes_by_priority(fresh)
+                print(f"  Math puzzle pattern code: {sorted_fresh[0]} (all: {sorted_fresh})", flush=True)
+                return sorted_fresh[0]
+            # All pattern codes are stale/false-positive - return None to avoid wasting time
+            print(f"  Math puzzle pattern: all codes stale/FP: {puzzle_code}", flush=True)
+            return None
         return None
 
     async def _hide_stuck_modals(self) -> int:
