@@ -22,6 +22,7 @@ __pycache__/
 
 # Results
 results_*.json
+agent_*.json
 
 # Package
 *.zip
