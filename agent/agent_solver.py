@@ -24,6 +24,7 @@ class AgentChallengeSolver:
         self.metrics = MetricsTracker()
         self.current_step = 0
         self.keep_browser_open = False
+        self.submit_is_trap = False  # Set when "Wrong Button!" detected
 
     async def run(self, start_url: str, headless: bool = False) -> dict:
         """Run through all 30 challenges."""
@@ -78,6 +79,7 @@ class AgentChallengeSolver:
         action_history: list[str] = []
         max_attempts = 15
         scroll_attempted = False  # Prevent running scroll-to-find multiple times per step
+        self.submit_is_trap = False  # Reset per step
 
         # Wait for React to render
         await self._wait_for_content()
@@ -113,11 +115,13 @@ class AgentChallengeSolver:
                 await self.browser.page.evaluate("window.scrollTo(0, 1000)")
                 await asyncio.sleep(0.3)
 
-                # Click Reveal Code buttons
+                # Click Reveal Code buttons + Service Worker buttons
                 await self.browser.page.evaluate("""() => {
                     document.querySelectorAll('button').forEach(btn => {
                         const t = btn.textContent.toLowerCase();
-                        if ((t.includes('reveal') || t.includes('accept')) && btn.offsetParent && !btn.disabled) {
+                        if ((t.includes('reveal') || t.includes('accept') ||
+                             t.includes('register') || t.includes('retrieve')) && 
+                            btn.offsetParent && !btn.disabled) {
                             btn.click();
                         }
                     });
@@ -194,6 +198,18 @@ class AgentChallengeSolver:
                             print(f"  >>> PASSED <<<", flush=True)
                             return True
                         failed_codes.append(math_code)
+
+                    # Force-reset puzzle if showing stale "already solved" state
+                    if 'solved' in html_text.lower() and 'code revealed' in html_text.lower():
+                        fresh_code = await self._force_reset_puzzle()
+                        if fresh_code and fresh_code not in failed_codes:
+                            print(f"  Force-reset puzzle code: {fresh_code}", flush=True)
+                            if await self._fill_and_submit(fresh_code, step):
+                                self.metrics.end_challenge(step, True, total_tin, total_tout)
+                                print(f"  >>> PASSED (force-reset puzzle) <<<", flush=True)
+                                return True
+                            failed_codes.append(fresh_code)
+
                     # Even if math code was stale, solving puzzle may have unlocked something
                     # Try deep extraction after puzzle solve (React state may have changed)
                     post_math_codes = await self._deep_code_extraction(failed_codes)
@@ -241,7 +257,7 @@ class AgentChallengeSolver:
                             !el.closest('.fixed:not(:has(input[type="text"]))'));
                         if (candidates.length === 0) {
                             const bordered = [...document.querySelectorAll('div')].filter(el => {
-                                const cls = el.className || '';
+                                const cls = el.getAttribute('class') || '';
                                 return cls.includes('border-2') && cls.includes('rounded') && el.offsetParent && el.offsetWidth > 50;
                             });
                             if (bordered.length > 0) candidates.push(...bordered);
@@ -278,6 +294,17 @@ class AgentChallengeSolver:
                 if has_canvas and ('draw' in html_text.lower() or 'canvas' in html_text.lower() or 'stroke' in html_text.lower()):
                     await self._try_canvas_challenge()
 
+                # Handle Service Worker challenge
+                if 'service worker' in html_text.lower() or ('register' in html_text.lower() and 'cache' in html_text.lower()):
+                    sw_code = await self._try_service_worker_challenge()
+                    if sw_code and sw_code not in failed_codes:
+                        print(f"  Service Worker code: {sw_code}", flush=True)
+                        if await self._fill_and_submit(sw_code, step):
+                            self.metrics.end_challenge(step, True, total_tin, total_tout)
+                            print(f"  >>> PASSED (service worker) <<<", flush=True)
+                            return True
+                        failed_codes.append(sw_code)
+
                 # Handle split parts challenge
                 if 'part' in html_text.lower() and ('found' in html_text.lower() or 'collect' in html_text.lower()):
                     await self._try_split_parts()
@@ -310,6 +337,49 @@ class AgentChallengeSolver:
                             print(f"  >>> PASSED (deep extraction) <<<", flush=True)
                             return True
                         failed_codes.append(code)
+
+                # === Handle "Submit is trap" / animated button challenges ===
+                # If we detected that the normal submit button is a trap, try alternatives
+                if self.submit_is_trap:
+                    scroll_attempted = True  # Skip scroll-to-find when we know submit is trap
+                    trap_elapsed = time.time() - getattr(self, 'run_start', time.time())
+                    if trap_elapsed > 280:
+                        print(f"  Submit-is-trap: skipping, {trap_elapsed:.0f}s elapsed", flush=True)
+                    else:
+                        print(f"  Submit is trap - trying animated button with all codes...", flush=True)
+                        # Wait briefly for delayed content blocks to load
+                        await asyncio.sleep(1.5)
+                        # Re-extract codes after content loaded
+                        fresh_deep = await self._deep_code_extraction(failed_codes)
+                        all_codes_to_try = list(dict.fromkeys(
+                            (fresh_deep or []) + (deep_codes or []) + list(codes or []) + list(failed_codes)
+                        ))
+                        # Try each code with animated button
+                        for code in all_codes_to_try[:10]:
+                            if await self._try_animated_button_submit(code, step):
+                                self.metrics.end_challenge(step, True, total_tin, total_tout)
+                                print(f"  >>> PASSED (animated button) <<<", flush=True)
+                                return True
+                        # Also try brute-forcing with common patterns
+                        body_text = await self.browser.page.evaluate("() => document.body.textContent || ''")
+                        # Extract ALL 6-char codes visible on page
+                        all_visible = await self.browser.page.evaluate("""() => {
+                            const text = document.body.innerText || '';
+                            return [...new Set((text.match(/\\b[A-Z0-9]{6}\\b/g) || []))];
+                        }""")
+                        from dom_parser import FALSE_POSITIVES
+                        fresh_visible = [c for c in all_visible if c not in FALSE_POSITIVES]
+                        for code in fresh_visible[:10]:
+                            if await self._try_animated_button_submit(code, step):
+                                self.metrics.end_challenge(step, True, total_tin, total_tout)
+                                print(f"  >>> PASSED (animated+visible) <<<", flush=True)
+                                return True
+                        # When main submit is trap, try "trap" buttons as potential real submits
+                        print(f"  Trying trap buttons as real submits...", flush=True)
+                        if await self._try_trap_buttons(step, all_codes_to_try[:3]):
+                            self.metrics.end_challenge(step, True, total_tin, total_tout)
+                            print(f"  >>> PASSED (trap button was real) <<<", flush=True)
+                            return True
 
                 # Handle "Scroll Down to Find Navigation" - check headers, main container, and page structure
                 is_scroll_challenge = await self.browser.page.evaluate("""() => {
@@ -395,7 +465,7 @@ class AgentChallengeSolver:
                     const pieces = [...document.querySelectorAll('[draggable="true"]')];
                     const slots = [...document.querySelectorAll('div')].filter(el => {
                         const text = (el.textContent || '').trim();
-                        const cls = el.className || '';
+                        const cls = el.getAttribute('class') || '';
                         const style = el.getAttribute('style') || '';
                         return (text.match(/^Slot \\d+$/) &&
                                (cls.includes('dashed') || cls.includes('border-dashed') || style.includes('dashed'))) ||
@@ -880,6 +950,29 @@ class AgentChallengeSolver:
         url_before = await self.browser.get_url()
 
         try:
+            # If we already know submit is a trap, go straight to animated button
+            if self.submit_is_trap:
+                if await self._try_animated_button_submit(code, step):
+                    return True
+                # Try Enter key
+                await self.browser.page.evaluate(f"""() => {{
+                    const inp = document.querySelector('input[placeholder*="code" i], input[type="text"]');
+                    if (inp) {{
+                        const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                        s.call(inp, '{code}');
+                        inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        inp.focus();
+                    }}
+                }}""")
+                await self.browser.page.keyboard.press("Enter")
+                await asyncio.sleep(0.3)
+                url_after = await self.browser.get_url()
+                if url_after != url_before:
+                    print(f"    Code '{code}' WORKED (Enter bypass)!", flush=True)
+                    return True
+                return False
+
             # Scroll input into view
             await self.browser.page.evaluate("""() => {
                 const input = document.querySelector('input[placeholder*="code" i], input[type="text"]');
@@ -941,6 +1034,34 @@ class AgentChallengeSolver:
                 await self.browser.page.keyboard.press("Enter")
 
             await asyncio.sleep(0.4)
+
+            # Check for "Wrong Button!" popup (means button is trap, not code is wrong)
+            wrong_button = await self.browser.page.evaluate("""() => {
+                const text = document.body.textContent || '';
+                return text.includes('Wrong Button') || text.includes('wrong button');
+            }""")
+            if wrong_button:
+                self.submit_is_trap = True
+                print(f"    'Wrong Button!' detected - submit button is trap, trying animated button...", flush=True)
+                await self._clear_popups()
+                # Try animated/moving button as alternative submit
+                if await self._try_animated_button_submit(code, step):
+                    return True
+                # Also try just pressing Enter on the input
+                await self.browser.page.evaluate("""() => {
+                    const inp = document.querySelector('input[placeholder*="code" i], input[type="text"]');
+                    if (inp) inp.focus();
+                }""")
+                await self.browser.page.keyboard.press("Enter")
+                await asyncio.sleep(0.3)
+                url_after = await self.browser.get_url()
+                if url_after != url_before:
+                    print(f"    Code '{code}' WORKED (Enter key)!", flush=True)
+                    return True
+                # Return False but caller should know this is "wrong button" not "wrong code"
+                print(f"    Code '{code}' - button trap, code may be valid", flush=True)
+                return False
+
             url_after = await self.browser.get_url()
 
             if url_after != url_before:
@@ -951,6 +1072,80 @@ class AgentChallengeSolver:
                 return False
         except Exception as e:
             print(f"    Fill error: {e}", flush=True)
+            return False
+
+    async def _try_animated_button_submit(self, code: str, step: int) -> bool:
+        """Find animated/moving elements, freeze them, enter code, click as submit."""
+        try:
+            result = await self.browser.page.evaluate("""() => {
+                // Find elements with CSS animation (moveAround, bounce, etc.)
+                const animated = [];
+                document.querySelectorAll('*').forEach(el => {
+                    const style = getComputedStyle(el);
+                    const cls = el.getAttribute('class') || '';
+                    const hasAnimation = (style.animation && style.animation !== 'none' &&
+                        style.animationName !== 'none') ||
+                        cls.includes('animate-[move') || cls.includes('animate-[bounce');
+                    const isSmall = el.offsetWidth > 10 && el.offsetWidth < 200 &&
+                        el.offsetHeight > 10 && el.offsetHeight < 200;
+                    const isClickable = style.cursor === 'pointer' || cls.includes('cursor-pointer');
+                    if (hasAnimation && isSmall && isClickable && el.offsetParent) {
+                        animated.push(el);
+                    }
+                });
+                if (animated.length === 0) return {found: false};
+                // Freeze all animated elements and return first clickable
+                const results = [];
+                for (const el of animated) {
+                    el.style.animation = 'none';
+                    el.style.position = 'fixed';
+                    el.style.top = '50%';
+                    el.style.left = '50%';
+                    el.style.zIndex = '99999';
+                    el.style.transform = 'translate(-50%, -50%)';
+                    const r = el.getBoundingClientRect();
+                    results.push({
+                        x: Math.round(r.x + r.width/2),
+                        y: Math.round(r.y + r.height/2),
+                        text: (el.textContent || '').trim().substring(0, 40),
+                        cls: (el.getAttribute('class') || '').substring(0, 60)
+                    });
+                }
+                return {found: true, elements: results};
+            }""")
+            if not result or not result.get('found'):
+                return False
+
+            elements = result.get('elements', [])
+            print(f"  Found {len(elements)} animated elements, trying as submit...", flush=True)
+
+            # Fill code in input
+            await self.browser.page.evaluate(f"""() => {{
+                const inp = document.querySelector('input[placeholder*="code" i], input[type="text"]');
+                if (inp) {{
+                    const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                    s.call(inp, '{code}');
+                    inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                }}
+            }}""")
+            await asyncio.sleep(0.1)
+
+            for el in elements:
+                await self._clear_popups()
+                try:
+                    await self.browser.page.mouse.click(el['x'], el['y'])
+                except Exception:
+                    pass
+                await asyncio.sleep(0.3)
+                url = await self.browser.get_url()
+                if self._check_progress(url, step):
+                    print(f"  Animated button '{el['text']}' with code '{code}' WORKED!", flush=True)
+                    return True
+
+            return False
+        except Exception as e:
+            print(f"  Animated button error: {e}", flush=True)
             return False
 
     async def _brute_force_radio(self, step: int) -> bool:
@@ -1041,9 +1236,11 @@ class AgentChallengeSolver:
         if radio_count == 0:
             return False
 
-        print(f"  Brute-forcing {radio_count} {radio_type} options...", flush=True)
+        # Cap at 15 to avoid wasting time on large option sets
+        effective_count = min(radio_count, 15)
+        print(f"  Brute-forcing {effective_count}/{radio_count} {radio_type} options...", flush=True)
 
-        for i in range(radio_count):
+        for i in range(effective_count):
             await self.browser.page.evaluate("""(idx) => {
                 // Find all option elements (re-find for React re-renders)
                 let options = [...document.querySelectorAll('input[type="radio"]')];
@@ -1087,7 +1284,7 @@ class AgentChallengeSolver:
                 return True
 
         # Hide modal if all wrong
-        print(f"  All {radio_count} radio options wrong, hiding modal", flush=True)
+        print(f"  All {effective_count} radio options wrong, hiding modal", flush=True)
         await self.browser.page.evaluate("""() => {
             document.querySelectorAll('.fixed').forEach(el => {
                 const text = el.textContent || '';
@@ -1118,10 +1315,12 @@ class AgentChallengeSolver:
         if count == 0:
             return False
 
-        print(f"  Trying {len(codes)} codes with {count} trap buttons...", flush=True)
+        # If many trap buttons, they're likely all decoys - limit attempts
+        max_btns = 8 if count > 15 else min(count, 15)
+        print(f"  Trying {min(len(codes), 2)} codes with {max_btns}/{count} trap buttons...", flush=True)
 
-        for code in codes[:5]:
-            for i in range(min(count, 40)):
+        for code in codes[:2]:
+            for i in range(max_btns):
                 # Clear any blocking popups from previous wrong-button clicks
                 await self._clear_popups()
 
@@ -1287,6 +1486,156 @@ class AgentChallengeSolver:
             return None
         return None
 
+    async def _force_reset_puzzle(self) -> str | None:
+        """Force-reset a math puzzle that shows cached 'already solved' state.
+        Resets the React component state to re-trigger code generation."""
+        try:
+            # Step 1: Find the math answer from the page text
+            expr = await self.browser.page.evaluate("""() => {
+                const text = document.body.textContent || '';
+                const m = text.match(/(\\d+)\\s*([+\\-*×÷\\/])\\s*(\\d+)\\s*=\\s*\\?/);
+                if (!m) return null;
+                const a = parseInt(m[1]), op = m[2], b = parseInt(m[3]);
+                switch(op) {
+                    case '+': return String(a + b);
+                    case '-': return String(a - b);
+                    case '*': case '×': return String(a * b);
+                    case '/': case '÷': return String(Math.floor(a / b));
+                    default: return String(a + b);
+                }
+            }""")
+            if not expr:
+                return None
+
+            print(f"  Force-reset puzzle: answer={expr}", flush=True)
+
+            # Step 2: Record codes before reset
+            codes_before = set(await self.browser.page.evaluate("""() => {
+                const text = document.body.textContent || '';
+                return [...new Set((text.match(/\\b[A-Z0-9]{6}\\b/g) || []))];
+            }"""))
+
+            # Step 3: Find puzzle container and reset React state via fiber
+            reset_ok = await self.browser.page.evaluate("""() => {
+                // Find the puzzle component (contains "Puzzle" and "Solve" text)
+                const puzzleEls = [...document.querySelectorAll('div')].filter(el => {
+                    const t = el.textContent || '';
+                    return t.includes('Puzzle') && (t.includes('solved') || t.includes('Code revealed'))
+                        && el.offsetParent && el.offsetWidth > 100;
+                });
+                // Sort by specificity (smallest container with puzzle text)
+                puzzleEls.sort((a, b) => a.textContent.length - b.textContent.length);
+
+                for (const el of puzzleEls.slice(0, 3)) {
+                    // Try to find React fiber
+                    const fiberKey = Object.keys(el).find(k =>
+                        k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+                    if (!fiberKey) continue;
+                    let fiber = el[fiberKey];
+
+                    // Walk up the fiber tree to find state with 'solved' or 'code'
+                    let attempts = 0;
+                    while (fiber && attempts < 30) {
+                        if (fiber.memoizedState) {
+                            let state = fiber.memoizedState;
+                            let stateIdx = 0;
+                            while (state && stateIdx < 20) {
+                                const q = state.queue || state;
+                                const val = state.memoizedState;
+                                // Reset boolean states (likely 'solved' flag)
+                                if (val === true && state.queue) {
+                                    const dispatch = state.queue.dispatch;
+                                    if (dispatch) {
+                                        try { dispatch(false); } catch(e) {}
+                                    }
+                                }
+                                // Reset string states that look like codes
+                                if (typeof val === 'string' && /^[A-Z0-9]{6}$/.test(val) && state.queue) {
+                                    const dispatch = state.queue.dispatch;
+                                    if (dispatch) {
+                                        try { dispatch(''); } catch(e) {}
+                                    }
+                                }
+                                // Reset number states that might be attempt counters
+                                if (typeof val === 'number' && val > 0 && val < 100 && state.queue) {
+                                    const dispatch = state.queue.dispatch;
+                                    if (dispatch) {
+                                        try { dispatch(0); } catch(e) {}
+                                    }
+                                }
+                                state = state.next;
+                                stateIdx++;
+                            }
+                        }
+                        fiber = fiber.return;
+                        attempts++;
+                    }
+                }
+                return true;
+            }""")
+
+            await asyncio.sleep(0.5)
+
+            # Step 4: Check if input appeared after reset
+            has_input = await self.browser.page.evaluate("""() => {
+                const inp = document.querySelector('input[type="number"], input[inputmode="numeric"], ' +
+                    'input[placeholder*="answer" i], input[placeholder*="solution" i]');
+                return !!(inp && inp.offsetParent);
+            }""")
+
+            if has_input:
+                print(f"  Force-reset: puzzle input appeared, entering {expr}...", flush=True)
+                # Fill answer and solve
+                await self.browser.page.evaluate(f"""() => {{
+                    const sels = ['input[type="number"]', 'input[inputmode="numeric"]',
+                        'input[placeholder*="answer" i]', 'input[placeholder*="solution" i]'];
+                    for (const sel of sels) {{
+                        const inp = document.querySelector(sel);
+                        if (inp && inp.offsetParent) {{
+                            const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                            s.call(inp, '{expr}');
+                            inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            inp.focus();
+                            break;
+                        }}
+                    }}
+                }}""")
+                await asyncio.sleep(0.2)
+                await self.browser.page.keyboard.press("Enter")
+                await asyncio.sleep(0.5)
+
+                # Click Solve button
+                await self.browser.page.evaluate("""() => {
+                    const btns = [...document.querySelectorAll('button')];
+                    for (const btn of btns) {
+                        const t = (btn.textContent || '').trim().toLowerCase();
+                        if ((t === 'solve' || t.includes('check') || t.includes('verify')) && !btn.disabled) {
+                            btn.click(); break;
+                        }
+                    }
+                }""")
+                await asyncio.sleep(0.8)
+
+            # Step 5: Check for new codes
+            codes_after = set(await self.browser.page.evaluate("""() => {
+                const text = document.body.textContent || '';
+                return [...new Set((text.match(/\\b[A-Z0-9]{6}\\b/g) || []))];
+            }"""))
+            from dom_parser import FALSE_POSITIVES
+            new_codes = codes_after - codes_before
+            fresh = [c for c in new_codes if c not in FALSE_POSITIVES]
+            if fresh:
+                sorted_fresh = self._sort_codes_by_priority(fresh)
+                print(f"  Force-reset puzzle: fresh code: {sorted_fresh[0]} (all: {sorted_fresh})", flush=True)
+                return sorted_fresh[0]
+
+            print(f"  Force-reset puzzle: no new codes generated", flush=True)
+            return None
+        except Exception as e:
+            print(f"  Force-reset puzzle error: {e}", flush=True)
+            return None
+
     async def _hide_stuck_modals(self) -> int:
         """Hide any modals that are blocking the page after failed radio attempts."""
         return await self.browser.page.evaluate("""() => {
@@ -1294,7 +1643,9 @@ class AgentChallengeSolver:
             document.querySelectorAll('.fixed').forEach(el => {
                 const text = el.textContent || '';
                 if ((text.includes('Please Select') || text.includes('Submit & Continue') ||
-                     text.includes('Submit and Continue')) && !el.querySelector('input[type="text"]')) {
+                     text.includes('Submit and Continue') || text.includes('Select an Option') ||
+                     (el.querySelector('input[type="radio"]') && text.includes('Submit'))) &&
+                    !el.querySelector('input[type="text"]')) {
                     el.style.display = 'none';
                     el.style.visibility = 'hidden';
                     el.style.pointerEvents = 'none';
@@ -1318,7 +1669,7 @@ class AgentChallengeSolver:
                     const emptySlots = [...document.querySelectorAll('div')].filter(el => {
                         const t = (el.textContent || '').trim();
                         return t.match(/^Slot \\d+$/) &&
-                               (el.className.includes('dashed') || (el.getAttribute('style') || '').includes('dashed'));
+                               ((el.getAttribute('class') || '').includes('dashed') || (el.getAttribute('style') || '').includes('dashed'));
                     }).map(el => {
                         el.scrollIntoView({behavior: 'instant', block: 'center'});
                         const rect = el.getBoundingClientRect();
@@ -1618,7 +1969,7 @@ class AgentChallengeSolver:
                         y: Math.round(r.y + r.height/2),
                         scrollable: el.scrollHeight - el.clientHeight,
                         tag: el.tagName,
-                        cls: (el.className || '').substring(0, 60)
+                        cls: (el.getAttribute('class') || '').substring(0, 60)
                     });
                 }
                 return results;
@@ -2472,6 +2823,85 @@ class AgentChallengeSolver:
             print(f"  Canvas error: {e}", flush=True)
             return False
 
+    async def _try_service_worker_challenge(self) -> str | None:
+        """Handle Service Worker Challenge: Register → wait for cache → Retrieve → extract code."""
+        try:
+            # Step 1: Click Register button
+            registered = await self.browser.page.evaluate("""() => {
+                const btns = [...document.querySelectorAll('button')];
+                // Check if already registered
+                const text = document.body.textContent || '';
+                if (text.includes('Registered') || text.includes('● Registered')) {
+                    return 'already';
+                }
+                for (const btn of btns) {
+                    const t = (btn.textContent || '').trim().toLowerCase();
+                    if ((t.includes('register') && t.includes('service')) ||
+                        (t.includes('register') && !btn.disabled && btn.offsetParent)) {
+                        btn.click();
+                        return 'clicked';
+                    }
+                }
+                return null;
+            }""")
+            if not registered:
+                return None
+            print(f"  Service Worker: register={registered}", flush=True)
+
+            # Step 2: Wait for cache to be populated
+            for i in range(15):
+                cached = await self.browser.page.evaluate("""() => {
+                    const text = document.body.textContent || '';
+                    return text.includes('Cached') || text.includes('cached') ||
+                           text.includes('● Cached');
+                }""")
+                if cached:
+                    break
+                await asyncio.sleep(0.3)
+
+            # Step 3: Click Retrieve from Cache button
+            await self.browser.page.evaluate("""() => {
+                const btns = [...document.querySelectorAll('button')];
+                for (const btn of btns) {
+                    const t = (btn.textContent || '').trim().toLowerCase();
+                    if ((t.includes('retrieve') || t.includes('from cache')) &&
+                        !btn.disabled && btn.offsetParent) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            await asyncio.sleep(0.5)
+
+            # Step 4: Extract code from result
+            code = await self.browser.page.evaluate("""() => {
+                // Look for green box with code
+                const greens = document.querySelectorAll('.bg-green-100, .bg-green-50, .text-green-600, .text-green-700, .border-green-500');
+                for (const el of greens) {
+                    const m = (el.textContent || '').match(/\\b([A-Z0-9]{6})\\b/);
+                    if (m) return m[1];
+                }
+                // Look for "code is:" pattern
+                const text = document.body.textContent || '';
+                const m = text.match(/(?:code\\s+(?:is|retrieved)[^:]*:\\s*)([A-Z0-9]{6})/i);
+                if (m) return m[1].toUpperCase();
+                // Look for any new 6-char code near "retrieved" or "cache"
+                const m2 = text.match(/(?:retrieved|cache)[^.]*?\\b([A-Z0-9]{6})\\b/i);
+                if (m2) return m2[1].toUpperCase();
+                return null;
+            }""")
+            if code:
+                from dom_parser import FALSE_POSITIVES
+                if code not in FALSE_POSITIVES:
+                    print(f"  Service Worker: code={code}", flush=True)
+                    return code
+            print(f"  Service Worker: no code found", flush=True)
+            return None
+        except Exception as e:
+            print(f"  Service Worker error: {e}", flush=True)
+            return None
+
     async def _try_split_parts(self) -> bool:
         """Handle Split Parts Challenge - click scattered Part N elements."""
         try:
@@ -2486,7 +2916,7 @@ class AgentChallengeSolver:
                     let clicked = 0;
                     document.querySelectorAll('div').forEach(el => {
                         const style = getComputedStyle(el);
-                        const cls = el.className || '';
+                        const cls = el.getAttribute('class') || '';
                         const elText = (el.textContent || '').trim();
                         if (!(style.position === 'absolute' || cls.includes('absolute'))) return;
                         if (!elText.match(/Part\\s*\\d/i)) return;
