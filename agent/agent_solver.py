@@ -3330,37 +3330,20 @@ class AgentChallengeSolver:
             await asyncio.sleep(0.2)
             
             for click_round in range(12):
+                # Check progress and code with space-aware regex
                 result = await self.browser.page.evaluate("""() => {
                     const text = document.body.textContent || '';
-                    // Check if code revealed
                     const codeMatch = text.match(/(?:code|Code)[^:]*:\\s*([A-Z0-9]{6})/);
                     if (codeMatch) return {done: true, code: codeMatch[1]};
                     
-                    // Check progress - multiple patterns
+                    // Space-aware progress: "4 / 5" or "4/5"
                     let current = 0, total = 5;
-                    const m1 = text.match(/(\\d+)\\/(\\d+)\\s*(?:mutations?|triggered|complete)/i);
-                    const m2 = text.match(/(\\d+)\\/((\\d+))/);  // bare N/M
-                    const m3 = text.match(/Mutations?[^:]*?:\\s*(\\d+)\\/(\\d+)/i);
-                    const match = m1 || m3 || m2;
-                    if (match) { current = parseInt(match[1]); total = parseInt(match[2]); }
+                    const m = text.match(/(\\d+)\\s*\\/\\s*(\\d+)\\s*(?:mutations?|triggered|complete)/i) ||
+                              text.match(/Mutations?[^:]*?:\\s*(\\d+)\\s*\\/\\s*(\\d+)/i) ||
+                              text.match(/triggered[^:]*?:\\s*(\\d+)\\s*\\/\\s*(\\d+)/i);
+                    if (m) { current = parseInt(m[1]); total = parseInt(m[2]); }
                     
-                    // Find trigger/complete buttons with coordinates for Playwright click
-                    const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent && !b.disabled);
-                    let triggerBtn = null, completeBtn = null;
-                    for (const btn of btns) {
-                        const t = (btn.textContent || '').trim().toLowerCase();
-                        if (t.includes('trigger') && !t.includes('submit')) {
-                            const r = btn.getBoundingClientRect();
-                            triggerBtn = {x: r.x + r.width/2, y: r.y + r.height/2, text: t.substring(0, 30)};
-                        }
-                        if ((t.includes('complete') || t.includes('finish') || t.includes('reveal')) && 
-                            !t.includes('submit') && !t.includes('trigger')) {
-                            const r = btn.getBoundingClientRect();
-                            completeBtn = {x: r.x + r.width/2, y: r.y + r.height/2, text: t.substring(0, 30)};
-                        }
-                    }
-                    
-                    return {current, total, triggerBtn, completeBtn};
+                    return {current, total};
                 }""")
                 
                 if not result:
@@ -3375,24 +3358,31 @@ class AgentChallengeSolver:
                 current = result.get('current', 0)
                 total = result.get('total', 5)
                 
-                # If complete, use Playwright click on Complete button
-                if current >= total and result.get('completeBtn'):
-                    btn = result['completeBtn']
-                    print(f"  Mutation: clicking complete ({current}/{total})", flush=True)
-                    await self.browser.page.mouse.click(btn['x'], btn['y'])
-                    await asyncio.sleep(0.5)
-                    continue
+                # If complete, click Complete button via Playwright locator
+                if current >= total:
+                    try:
+                        complete_btn = self.browser.page.locator('button:has-text("Complete")').first
+                        if await complete_btn.is_visible(timeout=500):
+                            await complete_btn.click(timeout=2000)
+                            print(f"  Mutation: clicking complete ({current}/{total})", flush=True)
+                            await asyncio.sleep(0.5)
+                            continue
+                    except Exception:
+                        pass
                 
-                # Use Playwright mouse click on Trigger button
-                if result.get('triggerBtn'):
-                    btn = result['triggerBtn']
-                    print(f"  Mutation: trigger ({current}/{total})", flush=True)
-                    await self.browser.page.mouse.click(btn['x'], btn['y'])
-                    await asyncio.sleep(0.3)
-                else:
-                    break
+                # Click Trigger Mutation via Playwright locator
+                try:
+                    trigger_btn = self.browser.page.locator('button:has-text("Trigger")').first
+                    if await trigger_btn.is_visible(timeout=500):
+                        await trigger_btn.click(timeout=2000)
+                        print(f"  Mutation: trigger ({current}/{total})", flush=True)
+                        await asyncio.sleep(0.3)
+                        continue
+                except Exception:
+                    pass
+                break
             
-            # Final extraction - broader search
+            # Final extraction
             code = await self.browser.page.evaluate("""() => {
                 const text = document.body.textContent || '';
                 const m = text.match(/(?:code|Code)[^:]*:\\s*([A-Z0-9]{6})/);
@@ -3417,10 +3407,8 @@ class AgentChallengeSolver:
         try:
             extract_attempts = 0
             for click_round in range(15):
-                # CRITICAL: First scroll the iframe challenge into view
-                # Elements may be scrolled off-screen (negative y coords)
+                # Scroll iframe challenge into view
                 await self.browser.page.evaluate("""() => {
-                    // Find the iframe challenge container and scroll it into view
                     for (const el of document.querySelectorAll('div')) {
                         const t = (el.textContent || '').substring(0, 200);
                         if (t.includes('Iframe Challenge') || t.includes('Recursive Iframe')) {
@@ -3428,13 +3416,10 @@ class AgentChallengeSolver:
                             break;
                         }
                     }
-                    // Also try scrolling Extract Code button into view if it exists
-                    const extractBtn = [...document.querySelectorAll('button')].find(
-                        b => b.textContent.trim().toLowerCase().includes('extract'));
-                    if (extractBtn) extractBtn.scrollIntoView({behavior: 'instant', block: 'center'});
                 }""")
                 await asyncio.sleep(0.2)
                 
+                # Check state
                 result = await self.browser.page.evaluate("""() => {
                     const text = document.body.textContent || '';
                     
@@ -3442,55 +3427,51 @@ class AgentChallengeSolver:
                     const codeEls = document.querySelectorAll('.text-green-600, .text-green-700, .bg-green-100, .bg-green-50, .bg-emerald-100, .text-emerald-600, [class*="success"]');
                     for (const el of codeEls) {
                         const m = (el.textContent || '').match(/\\b([A-Z0-9]{6})\\b/);
-                        if (m && !['IFRAME','BWRONG','1WRONG'].includes(m[1])) return {done: true, code: m[1], source: 'green'};
+                        if (m && !['IFRAME','BWRONG','1WRONG','CWRONG'].includes(m[1])) return {done: true, code: m[1], source: 'green'};
                     }
                     const codeMatch = text.match(/(?:code|Code)[^:]*?:\\s*([A-Z0-9]{6})/);
-                    if (codeMatch && !['IFRAME','BWRONG','1WRONG'].includes(codeMatch[1])) return {done: true, code: codeMatch[1], source: 'text'};
+                    if (codeMatch && !['IFRAME','BWRONG','1WRONG','CWRONG'].includes(codeMatch[1])) return {done: true, code: codeMatch[1], source: 'text'};
                     
-                    // Check depth
-                    const depthMatch = text.match(/(?:depth|level)[^:]*?:\\s*(\\d+)\\/(\\d+)/i) ||
-                                       text.match(/(\\d+)\\/(\\d+)\\s*(?:depth|levels?)/i);
+                    // Space-aware depth: "4 / 5" or "4/5"
+                    const depthMatch = text.match(/(?:depth|level)[^:]*?:\\s*(\\d+)\\s*\\/\\s*(\\d+)/i) ||
+                                       text.match(/(\\d+)\\s*\\/\\s*(\\d+)\\s*(?:depth|levels?)/i);
                     const current = depthMatch ? parseInt(depthMatch[1]) : 0;
                     const total = depthMatch ? parseInt(depthMatch[2]) : 4;
                     
-                    // PRIORITY 1: Find incomplete level divs (green, not emerald = incomplete)
-                    // Completed levels: bg-emerald-50, Incomplete: bg-green-50 or no emerald
-                    let incompleteLevelDiv = null;
-                    const levelDivs = document.querySelectorAll('div[class*="border-2"][class*="rounded"]');
-                    for (const div of levelDivs) {
+                    // Find incomplete level divs (green, not emerald = not yet entered)
+                    const levelDivs = [];
+                    for (const div of document.querySelectorAll('div[class*="border-2"][class*="rounded"]')) {
                         const cls = div.getAttribute('class') || '';
                         const firstText = (div.childNodes[0]?.textContent || '').trim();
-                        if (/(?:Iframe\\s+)?Level\\s+\\d/i.test(firstText) && 
-                            !firstText.includes('✓') && !firstText.includes('✔') &&
-                            !cls.includes('emerald') &&
-                            div.offsetParent && div.offsetWidth > 50) {
-                            const r = div.getBoundingClientRect();
-                            incompleteLevelDiv = {x: r.x + r.width/2, y: r.y + r.height/2, text: firstText, w: r.width, h: r.height};
+                        const levelMatch = firstText.match(/(?:Iframe\\s+)?Level\\s+(\\d+)/i);
+                        if (levelMatch && div.offsetParent && div.offsetWidth > 50) {
+                            const isComplete = firstText.includes('✓') || firstText.includes('✔') || cls.includes('emerald');
+                            levelDivs.push({level: parseInt(levelMatch[1]), complete: isComplete, text: firstText});
                         }
                     }
                     
-                    // Find buttons with coordinates
-                    const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent && !b.disabled);
-                    let enterBtn = null, extractBtn = null;
-                    
-                    for (const btn of btns) {
-                        const t = (btn.textContent || '').trim().toLowerCase();
+                    // Find buttons
+                    const enterBtns = [];
+                    let extractBtn = false;
+                    for (const btn of document.querySelectorAll('button')) {
+                        if (!btn.offsetParent || btn.disabled) continue;
                         const r = btn.getBoundingClientRect();
-                        if (r.width === 0 && r.height === 0) continue; // hidden
-                        const coord = {x: r.x + r.width/2, y: r.y + r.height/2, text: t.substring(0, 30)};
-                        
-                        if ((t.includes('go deeper') || t.includes('enter level') || t.includes('next level') ||
-                             t.includes('descend') || t.includes('open level')) &&
-                            !t.includes('submit') && !t.includes('extract')) {
-                            enterBtn = coord;
+                        if (r.width === 0) continue;
+                        const t = (btn.textContent || '').trim().toLowerCase();
+                        const enterMatch = t.match(/enter\\s+level\\s+(\\d+)/i) || t.match(/level\\s+(\\d+)/i);
+                        if (enterMatch && !t.includes('submit') && !t.includes('extract')) {
+                            enterBtns.push({level: parseInt(enterMatch[1]), text: t});
                         }
-                        if (t.includes('extract') || (t.includes('reveal') && !t.includes('submit'))) {
-                            extractBtn = coord;
+                        if (t.includes('go deeper') || t.includes('next level') || t.includes('descend')) {
+                            enterBtns.push({level: current + 1, text: t});
+                        }
+                        if (t.includes('extract') || t.includes('get code')) {
+                            extractBtn = true;
                         }
                     }
                     
                     const atDeepest = text.includes('deepest level') || text.includes('reached the deepest');
-                    return {current, total, enterBtn, extractBtn, incompleteLevelDiv, atDeepest};
+                    return {current, total, levelDivs, enterBtns, extractBtn, atDeepest};
                 }""")
                 
                 if not result:
@@ -3505,37 +3486,91 @@ class AgentChallengeSolver:
                 current = result.get('current', 0)
                 total = result.get('total', 4)
                 
-                # PRIORITY 1: Click incomplete level divs (e.g. "Iframe Level 5" without ✓)
-                if result.get('incompleteLevelDiv'):
-                    target = result['incompleteLevelDiv']
-                    print(f"  Iframe: clicking incomplete level '{target['text']}' ({current}/{total})", flush=True)
-                    await self.browser.page.mouse.click(target['x'], target['y'])
-                    extract_attempts = 0
-                    await asyncio.sleep(0.4)
-                    continue
+                # PRIORITY 1: Click incomplete level div (one that's not emerald/checked)
+                level_divs = result.get('levelDivs', [])
+                incomplete = [d for d in level_divs if not d['complete']]
+                if incomplete:
+                    # Click the LOWEST incomplete level first
+                    incomplete.sort(key=lambda d: d['level'])
+                    target = incomplete[0]
+                    try:
+                        # Use evaluate_handle to get exact element, then Playwright click
+                        handle = await self.browser.page.evaluate_handle(f"""() => {{
+                            for (const div of document.querySelectorAll('div[class*="border-2"][class*="rounded"]')) {{
+                                const t = (div.childNodes[0]?.textContent || '').trim();
+                                if (t.includes('Level {target["level"]}') && !t.includes('✓') && !t.includes('✔')) {{
+                                    div.scrollIntoView({{behavior: 'instant', block: 'center'}});
+                                    return div;
+                                }}
+                            }}
+                            return null;
+                        }}""")
+                        el = handle.as_element()
+                        if el:
+                            await el.click(timeout=2000)
+                            print(f"  Iframe: clicked level div {target['level']} ({current}/{total})", flush=True)
+                            extract_attempts = 0
+                            await asyncio.sleep(0.4)
+                            continue
+                    except Exception as e:
+                        print(f"  Iframe: level div click failed: {e}", flush=True)
                 
-                # PRIORITY 2: Click Enter Level buttons
-                if current < total and result.get('enterBtn'):
-                    target = result['enterBtn']
-                    print(f"  Iframe: clicking {target['text']} ({current}/{total})", flush=True)
-                    await self.browser.page.mouse.click(target['x'], target['y'])
-                    extract_attempts = 0
-                    await asyncio.sleep(0.3)
-                    continue
+                # PRIORITY 2: Click Enter Level button for the CORRECT next level
+                enter_btns = result.get('enterBtns', [])
+                if current < total and enter_btns:
+                    # Sort by level, pick the one closest to current+1
+                    target_level = current + 1
+                    enter_btns.sort(key=lambda b: abs(b['level'] - target_level))
+                    target = enter_btns[0]
+                    try:
+                        handle = await self.browser.page.evaluate_handle(f"""() => {{
+                            for (const btn of document.querySelectorAll('button')) {{
+                                if (!btn.offsetParent || btn.disabled) continue;
+                                const t = btn.textContent.trim().toLowerCase();
+                                if (t.includes('{target["text"][:25]}')) {{
+                                    btn.scrollIntoView({{behavior: 'instant', block: 'center'}});
+                                    return btn;
+                                }}
+                            }}
+                            return null;
+                        }}""")
+                        el = handle.as_element()
+                        if el:
+                            await el.click(timeout=2000)
+                            print(f"  Iframe: clicked '{target['text']}' ({current}/{total})", flush=True)
+                            extract_attempts = 0
+                            await asyncio.sleep(0.3)
+                            continue
+                    except Exception as e:
+                        print(f"  Iframe: enter btn click failed: {e}", flush=True)
                 
-                # PRIORITY 3: Extract code (current >= total or at deepest)
+                # PRIORITY 3: Extract code (at deepest or current >= total)
                 if result.get('extractBtn') and (current >= total or result.get('atDeepest')):
                     extract_attempts += 1
                     if extract_attempts > 3:
                         print(f"  Iframe: Extract clicked {extract_attempts}x with no code, bailing", flush=True)
                         break
-                    btn = result['extractBtn']
-                    print(f"  Iframe: extract ({current}/{total})", flush=True)
-                    await self.browser.page.mouse.click(btn['x'], btn['y'])
-                    await asyncio.sleep(0.8)
-                    continue
+                    try:
+                        handle = await self.browser.page.evaluate_handle("""() => {
+                            for (const btn of document.querySelectorAll('button')) {
+                                if (!btn.offsetParent || btn.disabled) continue;
+                                const t = btn.textContent.trim().toLowerCase();
+                                if (t.includes('extract') || t.includes('get code')) {
+                                    btn.scrollIntoView({behavior: 'instant', block: 'center'});
+                                    return btn;
+                                }
+                            }
+                            return null;
+                        }""")
+                        el = handle.as_element()
+                        if el:
+                            await el.click(timeout=2000)
+                            print(f"  Iframe: extract ({current}/{total})", flush=True)
+                            await asyncio.sleep(0.8)
+                            continue
+                    except Exception as e:
+                        print(f"  Iframe: extract click failed: {e}", flush=True)
                 
-                # Nothing worked
                 print(f"  Iframe: nothing to click ({current}/{total}, deepest={result.get('atDeepest')})", flush=True)
                 break
             
