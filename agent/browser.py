@@ -1,4 +1,5 @@
 import asyncio
+import re
 from playwright.async_api import async_playwright, Page, Browser
 from typing import Any
 
@@ -8,6 +9,8 @@ class BrowserController:
         self.browser: Browser | None = None
         self.page: Page | None = None
         self.playwright = None
+        self.intercepted_codes: set[str] = set()
+        self._code_re = re.compile(r'\b[A-Z0-9]{6}\b')
 
     async def start(self, url: str, headless: bool = False) -> None:
         """Launch browser and navigate to URL."""
@@ -67,6 +70,21 @@ class BrowserController:
         """)
 
         await self.page.goto(url)
+
+        # Intercept network responses to capture codes from API calls
+        self.page.on("response", self._on_response)
+
+    async def _on_response(self, response):
+        """Capture 6-char codes from network responses."""
+        try:
+            ct = response.headers.get("content-type", "")
+            if "json" in ct or "text" in ct or "javascript" in ct:
+                body = await response.text()
+                if body and len(body) < 50000:
+                    matches = self._code_re.findall(body.upper())
+                    self.intercepted_codes.update(matches)
+        except Exception:
+            pass
 
     async def stop(self) -> None:
         """Close browser."""
