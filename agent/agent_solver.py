@@ -615,77 +615,58 @@ class AgentChallengeSolver:
             return True
         return False
 
-    async def _deep_code_extraction(self, known_codes: list[str] | None = None) -> list[str]:
-        """Extract codes from React fiber state, CSS pseudo-elements, shadow DOM, JS vars, network.
+    @staticmethod
+    def _sort_codes_by_priority(codes):
+        """Sort codes: mixed alpha+digit first (most likely real), then all-alpha/all-digit."""
+        def priority(c):
+            has_d = any(ch.isdigit() for ch in c)
+            has_a = any(ch.isalpha() for ch in c)
+            return (not (has_d and has_a), c)
+        return sorted(set(codes), key=priority)
 
-        Finds codes NOT in rendered DOM text — stored in React component state/props,
-        CSS content properties, shadow roots, or JavaScript variables.
-        """
+    async def _deep_code_extraction(self, known_codes: list[str] | None = None) -> list[str]:
+        """Extract codes from React fiber state, CSS pseudo-elements, shadow DOM, JS vars, network."""
         known = set(known_codes or [])
         all_codes = set()
 
-        # 1. React Fiber Tree Walking — extract codes from component state/props/hooks
+        # 1. React Fiber Tree Walking
         react_codes = await self.browser.page.evaluate("""() => {
             const codes = new Set();
             const CODE_RE = /^[A-Z0-9]{6}$/;
             const EMBEDDED_RE = /\\b[A-Z0-9]{6}\\b/g;
             const visited = new WeakSet();
-
             function extract(val, depth) {
                 if (depth > 8 || !val) return;
                 const t = typeof val;
                 if (t === 'string') {
                     if (CODE_RE.test(val)) codes.add(val);
-                    else if (val.length < 500) {
-                        const m = val.match(EMBEDDED_RE);
-                        if (m) m.forEach(c => codes.add(c));
-                    }
-                } else if (t === 'number') {
-                    return;
+                    else if (val.length < 500) { const m = val.match(EMBEDDED_RE); if (m) m.forEach(c => codes.add(c)); }
+                } else if (t === 'number') { return;
                 } else if (Array.isArray(val)) {
                     for (let i = 0; i < Math.min(val.length, 50); i++) extract(val[i], depth + 1);
                 } else if (t === 'object') {
-                    if (visited.has(val)) return;
-                    visited.add(val);
-                    try {
-                        const keys = Object.keys(val);
-                        for (let i = 0; i < Math.min(keys.length, 100); i++) {
-                            extract(val[keys[i]], depth + 1);
-                        }
-                    } catch(e) {}
+                    if (visited.has(val)) return; visited.add(val);
+                    try { const keys = Object.keys(val); for (let i = 0; i < Math.min(keys.length, 100); i++) extract(val[keys[i]], depth + 1); } catch(e) {}
                 }
             }
-
             function walkFiber(fiber, depth) {
-                if (!fiber || depth > 60 || visited.has(fiber)) return;
-                visited.add(fiber);
-                // Walk hooks chain (memoizedState)
+                if (!fiber || depth > 60 || visited.has(fiber)) return; visited.add(fiber);
                 let hook = fiber.memoizedState;
                 for (let i = 0; hook && i < 40; i++, hook = hook.next) {
                     extract(hook.memoizedState, 0);
                     if (hook.queue) extract(hook.queue.lastRenderedState, 0);
                     if (hook.baseState !== undefined) extract(hook.baseState, 0);
                 }
-                // Props
-                extract(fiber.memoizedProps, 0);
-                extract(fiber.pendingProps, 0);
-                // Class component state
-                if (fiber.stateNode && typeof fiber.stateNode === 'object'
-                    && !(fiber.stateNode instanceof HTMLElement)) {
+                extract(fiber.memoizedProps, 0); extract(fiber.pendingProps, 0);
+                if (fiber.stateNode && typeof fiber.stateNode === 'object' && !(fiber.stateNode instanceof HTMLElement)) {
                     try { extract(fiber.stateNode.state, 0); } catch(e) {}
                     try { extract(fiber.stateNode.props, 0); } catch(e) {}
                 }
-                walkFiber(fiber.child, depth + 1);
-                walkFiber(fiber.sibling, depth + 1);
+                walkFiber(fiber.child, depth + 1); walkFiber(fiber.sibling, depth + 1);
             }
-
-            // Find React roots
             document.querySelectorAll('*').forEach(el => {
                 for (const key of Object.keys(el)) {
-                    if (key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$')) {
-                        walkFiber(el[key], 0);
-                        break;
-                    }
+                    if (key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$')) { walkFiber(el[key], 0); break; }
                 }
             });
             return [...codes];
@@ -694,29 +675,17 @@ class AgentChallengeSolver:
 
         # 2. CSS pseudo-element content & custom properties
         css_codes = await self.browser.page.evaluate("""() => {
-            const codes = [];
-            const RE = /[A-Z0-9]{6}/g;
+            const codes = []; const RE = /[A-Z0-9]{6}/g;
             const els = document.querySelectorAll('*');
             for (let i = 0; i < els.length; i++) {
                 for (const pseudo of ['::before', '::after']) {
-                    try {
-                        const c = window.getComputedStyle(els[i], pseudo).content;
-                        if (c && c !== 'none' && c !== 'normal' && c !== '""') {
-                            const m = c.toUpperCase().match(RE);
-                            if (m) codes.push(...m);
-                        }
+                    try { const c = window.getComputedStyle(els[i], pseudo).content;
+                        if (c && c !== 'none' && c !== 'normal' && c !== '""') { const m = c.toUpperCase().match(RE); if (m) codes.push(...m); }
                     } catch(e) {}
                 }
             }
-            try {
-                const rs = getComputedStyle(document.documentElement);
-                for (let i = 0; i < rs.length; i++) {
-                    if (rs[i].startsWith('--')) {
-                        const v = rs.getPropertyValue(rs[i]);
-                        const m = v.toUpperCase().match(RE);
-                        if (m) codes.push(...m);
-                    }
-                }
+            try { const rs = getComputedStyle(document.documentElement);
+                for (let i = 0; i < rs.length; i++) { if (rs[i].startsWith('--')) { const v = rs.getPropertyValue(rs[i]); const m = v.toUpperCase().match(RE); if (m) codes.push(...m); } }
             } catch(e) {}
             return [...new Set(codes)];
         }""")
@@ -724,43 +693,23 @@ class AgentChallengeSolver:
 
         # 3. Shadow DOM traversal
         shadow_codes = await self.browser.page.evaluate("""() => {
-            const codes = [];
-            const RE = /\\b[A-Z0-9]{6}\\b/g;
-            function walk(root) {
-                if (!root || !root.shadowRoot) return;
-                const text = root.shadowRoot.textContent || '';
-                const html = root.shadowRoot.innerHTML || '';
-                const m = (text + ' ' + html).toUpperCase().match(RE);
-                if (m) codes.push(...m);
-                root.shadowRoot.querySelectorAll('*').forEach(walk);
+            const codes = []; const RE = /\\b[A-Z0-9]{6}\\b/g;
+            function walk(root) { if (!root || !root.shadowRoot) return;
+                const m = ((root.shadowRoot.textContent||'') + ' ' + (root.shadowRoot.innerHTML||'')).toUpperCase().match(RE);
+                if (m) codes.push(...m); root.shadowRoot.querySelectorAll('*').forEach(walk);
             }
-            document.querySelectorAll('*').forEach(walk);
-            return [...new Set(codes)];
+            document.querySelectorAll('*').forEach(walk); return [...new Set(codes)];
         }""")
         all_codes.update(shadow_codes or [])
 
         # 4. JavaScript global variable scan
         js_codes = await self.browser.page.evaluate("""() => {
-            const codes = [];
-            const RE = /\\b[A-Z0-9]{6}\\b/g;
-            const candidates = ['__NEXT_DATA__', '__APP_DATA__', '__CHALLENGE__',
-                               '__code', '__CODE', 'challengeCode', 'currentCode',
-                               'navCode', 'secretCode', 'hiddenCode'];
-            for (const g of candidates) {
-                try {
-                    const v = window[g];
-                    if (!v) continue;
-                    const s = typeof v === 'string' ? v : JSON.stringify(v).substring(0, 10000);
-                    const m = s.toUpperCase().match(RE);
-                    if (m) codes.push(...m);
-                } catch(e) {}
-            }
-            for (const k of Object.getOwnPropertyNames(window)) {
-                try {
-                    const v = window[k];
-                    if (typeof v === 'string' && /^[A-Z0-9]{6}$/.test(v)) codes.push(v);
-                } catch(e) {}
-            }
+            const codes = []; const RE = /\\b[A-Z0-9]{6}\\b/g;
+            const candidates = ['__NEXT_DATA__','__APP_DATA__','__CHALLENGE__','__code','__CODE','challengeCode','currentCode','navCode','secretCode','hiddenCode'];
+            for (const g of candidates) { try { const v = window[g]; if (!v) continue;
+                const s = typeof v === 'string' ? v : JSON.stringify(v).substring(0,10000); const m = s.toUpperCase().match(RE); if (m) codes.push(...m);
+            } catch(e) {} }
+            for (const k of Object.getOwnPropertyNames(window)) { try { const v = window[k]; if (typeof v === 'string' && /^[A-Z0-9]{6}$/.test(v)) codes.push(v); } catch(e) {} }
             return [...new Set(codes)];
         }""")
         all_codes.update(js_codes or [])
@@ -770,16 +719,11 @@ class AgentChallengeSolver:
 
         # 6. Iframe content
         iframe_codes = await self.browser.page.evaluate("""() => {
-            const codes = [];
-            const RE = /\\b[A-Z0-9]{6}\\b/g;
+            const codes = []; const RE = /\\b[A-Z0-9]{6}\\b/g;
             document.querySelectorAll('iframe').forEach(iframe => {
-                try {
-                    const doc = iframe.contentDocument || iframe.contentWindow.document;
-                    const text = doc.body ? doc.body.textContent : '';
-                    const m = text.toUpperCase().match(RE);
-                    if (m) codes.push(...m);
-                } catch(e) {}
-            });
+                try { const doc = iframe.contentDocument || iframe.contentWindow.document;
+                    const m = (doc.body ? doc.body.textContent : '').toUpperCase().match(RE); if (m) codes.push(...m);
+                } catch(e) {} });
             return [...new Set(codes)];
         }""")
         all_codes.update(iframe_codes or [])
@@ -804,14 +748,7 @@ class AgentChallengeSolver:
         all_codes -= known
         all_codes = {c for c in all_codes if not c.isdigit()}
         all_codes = {c for c in all_codes if not re.match(r'^\d+(?:PX|VH|VW|EM|REM|MS|FR)$', c)}
-
-        # Sort: codes with both letters AND digits first (most likely real)
-        def score(c):
-            has_digit = any(ch.isdigit() for ch in c)
-            has_letter = any(ch.isalpha() for ch in c)
-            return (not (has_digit and has_letter), c)
-
-        return sorted(all_codes, key=score)
+        return self._sort_codes_by_priority(all_codes)
 
     async def _clear_popups(self) -> int:
         """Clear blocking popups using deterministic JS. Returns count cleared."""
@@ -1363,18 +1300,25 @@ class AgentChallengeSolver:
         try:
             print(f"  Scroll-to-find: searching...", flush=True)
 
-            # Fill code in input if available
-            if codes_to_try:
-                code = codes_to_try[-1]
-                await self.browser.page.evaluate(f"""() => {{
-                    const inp = document.querySelector('input[placeholder*="code" i], input[type="text"]');
-                    if (inp) {{
-                        const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-                        s.call(inp, '{code}');
-                        inp.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        inp.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    }}
-                }}""")
+            # Sort codes by priority: mixed alpha+digit first (most likely real codes)
+            sorted_codes = self._sort_codes_by_priority(codes_to_try) if codes_to_try else []
+
+            # Fill BEST code in input (mixed alpha+digit preferred over all-alpha like PROXIM)
+            async def _fill_best_code(code_override=None):
+                c = code_override or (sorted_codes[0] if sorted_codes else None)
+                if c:
+                    await self.browser.page.evaluate(f"""() => {{
+                        const inp = document.querySelector('input[placeholder*="code" i], input[type="text"]');
+                        if (inp) {{
+                            const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                            s.call(inp, '{c}');
+                            inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        }}
+                    }}""")
+                return c
+
+            best_code = await _fill_best_code()
 
             TRAP_WORDS = {'proceed', 'continue', 'next step', 'next page', 'next section',
                           'go to next', 'click here', 'go forward', 'advance'}
@@ -1498,6 +1442,7 @@ class AgentChallengeSolver:
             # ===== Phase 0-slow: Slow incremental scroll with pauses =====
             # Some IntersectionObservers need the element visible for a minimum duration.
             print(f"  Scroll-to-find: phase 0-slow - incremental scroll...", flush=True)
+            await _fill_best_code()  # Ensure best code is in input
             await self.browser.page.evaluate("window.scrollTo(0, 0)")
             await asyncio.sleep(0.2)
             total_h = await self.browser.page.evaluate("() => document.body.scrollHeight")
@@ -1508,7 +1453,7 @@ class AgentChallengeSolver:
                 if time.time() - slow_start > 20:
                     break
                 await self.browser.page.mouse.wheel(0, slow_step)
-                await asyncio.sleep(0.25)  # 250ms pause for observers
+                await asyncio.sleep(0.25)
                 url = await self.browser.get_url()
                 if self._check_progress(url, self.current_step):
                     print(f"  Phase 0-slow: auto-nav at ~{pos}px!", flush=True)
@@ -1528,7 +1473,7 @@ class AgentChallengeSolver:
                         return True
 
             # ===== Phase 0-sections: scrollIntoView each section =====
-            # IntersectionObserver may watch a specific sentinel element.
+            await _fill_best_code()  # Re-fill best code
             section_count = await self.browser.page.evaluate("""() => {
                 return [...document.querySelectorAll('div')].filter(el => {
                     const t = (el.textContent || '').trim();
@@ -1834,6 +1779,7 @@ class AgentChallengeSolver:
 
             # Phase 3: Fast full-page button scan
             # Step A: Thorough scroll with mouse.wheel to trigger rendering + fire events
+            await _fill_best_code()  # Ensure correct code in input before clicking buttons
             total_h = await self.browser.page.evaluate("() => document.body.scrollHeight")
             await self.browser.page.evaluate("window.scrollTo(0, 0)")
             await asyncio.sleep(0.05)
@@ -1914,9 +1860,9 @@ class AgentChallengeSolver:
                     if await self._fill_and_submit(code, self.current_step):
                         return True
 
-            # Step E: Try pressing Enter with each code
-            if codes_to_try:
-                for code in codes_to_try[:3]:
+            # Step E: Try pressing Enter with each code (best codes first)
+            if sorted_codes:
+                for code in sorted_codes[:3]:
                     await self.browser.page.evaluate("window.scrollTo(0, 0)")
                     await asyncio.sleep(0.05)
                     inp = self.browser.page.locator('input[placeholder*="code" i], input[type="text"]').first
@@ -1934,6 +1880,7 @@ class AgentChallengeSolver:
 
             # Phase 4: Playwright-native clicks + code accumulation during scroll
             # Extract codes at each scroll position (virtualized content only exists in viewport)
+            await _fill_best_code()  # Ensure correct code in input
             print(f"  Scroll-to-find: phase 4 - Playwright native clicks...", flush=True)
             total_h = await self.browser.page.evaluate("() => document.body.scrollHeight")
             clicked = 0
@@ -2104,6 +2051,7 @@ class AgentChallengeSolver:
                     return True
 
             # Phase 7: Use Playwright locators (auto scroll-into-view, handles virtual lists)
+            await _fill_best_code()  # Ensure correct code in input
             print(f"  Scroll-to-find: phase 7 - Playwright locator clicks...", flush=True)
             try:
                 # Try clicking EVERY button on the page using Playwright locators
@@ -2136,8 +2084,7 @@ class AgentChallengeSolver:
             except Exception as e:
                 print(f"  Phase 7 error: {e}", flush=True)
 
-            # DEBUG: dump page state when all phases fail
-            # Last resort: deep extraction one more time after all scrolling
+            # ===== LAST RESORT: Deep extraction + try other codes =====
             last_deep = await self._deep_code_extraction(codes_to_try)
             if last_deep:
                 print(f"  LAST RESORT: deep extraction found {len(last_deep)} codes: {last_deep[:10]}", flush=True)
@@ -2146,6 +2093,41 @@ class AgentChallengeSolver:
                         print(f"  LAST RESORT: code '{code}' WORKED!", flush=True)
                         return True
 
+            # Try alternate codes with a quick Phase 0 scroll
+            alt_codes = [c for c in sorted_codes[1:] if c != best_code][:3]
+            for alt_code in alt_codes:
+                print(f"  LAST RESORT: retrying with code '{alt_code}'...", flush=True)
+                await _fill_best_code(alt_code)
+                await self.browser.page.evaluate("window.scrollTo(0, 0)")
+                await asyncio.sleep(0.1)
+                prev_y = 0
+                retry_start = time.time()
+                while time.time() - retry_start < 10:
+                    await self.browser.page.mouse.wheel(0, 800)
+                    await asyncio.sleep(0.12)
+                    url = await self.browser.get_url()
+                    if self._check_progress(url, self.current_step):
+                        print(f"  LAST RESORT: auto-nav with code '{alt_code}'!", flush=True)
+                        return True
+                    cur_y = await self.browser.page.evaluate("() => window.scrollY")
+                    if cur_y <= prev_y and prev_y > 100:
+                        break
+                    prev_y = cur_y
+
+            # React debug info
+            react_debug = await self.browser.page.evaluate("""() => {
+                const info = {hasReact: false, fiberRoots: 0, stateStrings: []};
+                let count = 0;
+                document.querySelectorAll('*').forEach(el => {
+                    for (const key of Object.keys(el)) {
+                        if (key.startsWith('__reactFiber$')) { info.hasReact = true; count++; }
+                    }
+                });
+                info.fiberRoots = count;
+                return info;
+            }""")
+
+            # DEBUG: dump page state when all phases fail
             debug_info = await self.browser.page.evaluate("""() => {
                 const vh = window.innerHeight;
                 const scrollH = document.body.scrollHeight;
@@ -2170,44 +2152,11 @@ class AgentChallengeSolver:
                 return {scrollH, allBtns, allLinks, allInputs, allForms, iframes, canvases,
                         scrollable, bottomText: bottomText.substring(0, 300), dataEls: dataEls.slice(0, 5)};
             }""")
-            # React state debug
-            react_debug = await self.browser.page.evaluate("""() => {
-                const info = {hasReact: false, fiberRoots: 0, stateStrings: []};
-                let count = 0;
-                document.querySelectorAll('*').forEach(el => {
-                    for (const key of Object.keys(el)) {
-                        if (key.startsWith('__reactFiber$')) { info.hasReact = true; count++; }
-                    }
-                });
-                info.fiberRoots = count;
-                const root = document.getElementById('root') || document.querySelector('[id]');
-                if (root) {
-                    const fk = Object.keys(root).find(k => k.startsWith('__reactFiber$'));
-                    if (fk) {
-                        const visited = new WeakSet();
-                        function sample(f, depth) {
-                            if (!f || depth > 15 || visited.has(f) || info.stateStrings.length > 20) return;
-                            visited.add(f);
-                            let h = f.memoizedState;
-                            for (let i = 0; h && i < 10; i++, h = h.next) {
-                                const v = h.memoizedState;
-                                if (typeof v === 'string' && v.length <= 20 && v.length >= 4)
-                                    info.stateStrings.push(v);
-                            }
-                            sample(f.child, depth+1);
-                            sample(f.sibling, depth+1);
-                        }
-                        sample(root[fk], 0);
-                    }
-                }
-                return info;
-            }""")
             print(f"  ALL PHASES FAILED. Debug: scrollH={debug_info['scrollH']}, btns={debug_info['allBtns']}, "
                   f"links={debug_info['allLinks']}, inputs={debug_info['allInputs']}, forms={debug_info['allForms']}, "
                   f"iframes={debug_info['iframes']}, canvases={debug_info['canvases']}, "
                   f"scrollableContainers={debug_info['scrollable']}", flush=True)
-            print(f"  React: hasReact={react_debug.get('hasReact')}, fibers={react_debug.get('fiberRoots')}, "
-                  f"stateStrings={react_debug.get('stateStrings', [])[:15]}", flush=True)
+            print(f"  React: hasReact={react_debug.get('hasReact')}, fibers={react_debug.get('fiberRoots')}", flush=True)
             if debug_info['dataEls']:
                 print(f"  Data-attr elements: {debug_info['dataEls']}", flush=True)
             print(f"  Bottom text: {debug_info['bottomText'][:200]}", flush=True)
