@@ -17,7 +17,7 @@ from metrics import MetricsTracker
 
 
 class AgentChallengeSolver:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, timeout: int = 300):
         self.api_key = api_key
         self.browser = BrowserController()
         self.vision = AgentVision(api_key)
@@ -25,6 +25,7 @@ class AgentChallengeSolver:
         self.current_step = 0
         self.keep_browser_open = False
         self.submit_is_trap = False  # Set when "Wrong Button!" detected
+        self.timeout = timeout
 
     async def run(self, start_url: str, headless: bool = False) -> dict:
         """Run through all 30 challenges."""
@@ -47,8 +48,8 @@ class AgentChallengeSolver:
                 print(f"  STEP {step}/30  (elapsed: {elapsed:.1f}s)", flush=True)
                 print(f"{'='*60}", flush=True)
 
-                # Soft timeout: stop starting new steps after 295s
-                if elapsed > 295:
+                # Soft timeout: stop starting new steps near the time limit
+                if elapsed > self.timeout - 10:
                     print(f"  SOFT TIMEOUT: {elapsed:.0f}s elapsed, stopping step loop", flush=True)
                     self.metrics.end_challenge(step, success=False, error="Soft timeout")
                     break
@@ -85,9 +86,9 @@ class AgentChallengeSolver:
         await self._wait_for_content()
 
         for attempt in range(max_attempts):
-            # Global time budget check - leave 5s buffer for cleanup
+            # Global time budget check - leave 15s buffer for cleanup
             global_elapsed = time.time() - getattr(self, 'run_start', time.time())
-            if global_elapsed > 290:
+            if global_elapsed > self.timeout - 15:
                 print(f"  TIMEOUT RISK: {global_elapsed:.0f}s elapsed, skipping remaining attempts", flush=True)
                 break
 
@@ -115,12 +116,13 @@ class AgentChallengeSolver:
                 await self.browser.page.evaluate("window.scrollTo(0, 1000)")
                 await asyncio.sleep(0.3)
 
-                # Click Reveal Code buttons + Service Worker buttons
+                # Click Reveal Code buttons + challenge-specific buttons
                 await self.browser.page.evaluate("""() => {
                     document.querySelectorAll('button').forEach(btn => {
                         const t = btn.textContent.toLowerCase();
                         if ((t.includes('reveal') || t.includes('accept') ||
-                             t.includes('register') || t.includes('retrieve')) && 
+                             t.includes('register') || t.includes('retrieve') ||
+                             t.includes('connect') || t.includes('trigger')) && 
                             btn.offsetParent && !btn.disabled) {
                             btn.click();
                         }
@@ -299,11 +301,86 @@ class AgentChallengeSolver:
                     sw_code = await self._try_service_worker_challenge()
                     if sw_code and sw_code not in failed_codes:
                         print(f"  Service Worker code: {sw_code}", flush=True)
-                        if await self._fill_and_submit(sw_code, step):
+                        if await self._submit_code_with_fallbacks(sw_code, step):
                             self.metrics.end_challenge(step, True, total_tin, total_tout)
                             print(f"  >>> PASSED (service worker) <<<", flush=True)
                             return True
                         failed_codes.append(sw_code)
+
+                # Handle Shadow DOM challenge (click through layers)
+                if 'shadow' in html_text.lower() and ('layer' in html_text.lower() or 'level' in html_text.lower() or 'nested' in html_text.lower()):
+                    shadow_code = await self._try_shadow_dom_challenge()
+                    if shadow_code and shadow_code not in failed_codes:
+                        print(f"  Shadow DOM code: {shadow_code}", flush=True)
+                        if await self._submit_code_with_fallbacks(shadow_code, step):
+                            self.metrics.end_challenge(step, True, total_tin, total_tout)
+                            print(f"  >>> PASSED (shadow DOM) <<<", flush=True)
+                            return True
+                        failed_codes.append(shadow_code)
+
+                # Handle WebSocket challenge (connect + receive)
+                if 'websocket' in html_text.lower() or ('connect' in html_text.lower() and 'server' in html_text.lower()):
+                    ws_code = await self._try_websocket_challenge()
+                    if ws_code and ws_code not in failed_codes:
+                        print(f"  WebSocket code: {ws_code}", flush=True)
+                        if await self._submit_code_with_fallbacks(ws_code, step):
+                            self.metrics.end_challenge(step, True, total_tin, total_tout)
+                            print(f"  >>> PASSED (websocket) <<<", flush=True)
+                            return True
+                        failed_codes.append(ws_code)
+
+                # Handle Delayed Reveal challenge (wait for timer)
+                if 'delayed' in html_text.lower() and ('reveal' in html_text.lower() or 'remaining' in html_text.lower() or 'wait' in html_text.lower()):
+                    delay_code = await self._try_delayed_reveal()
+                    if delay_code and delay_code not in failed_codes:
+                        print(f"  Delayed Reveal code: {delay_code}", flush=True)
+                        if await self._submit_code_with_fallbacks(delay_code, step):
+                            self.metrics.end_challenge(step, True, total_tin, total_tout)
+                            print(f"  >>> PASSED (delayed reveal) <<<", flush=True)
+                            return True
+                        failed_codes.append(delay_code)
+
+                # Re-evaluate html_text for late-loading challenges
+                html_text = await self.browser.page.evaluate("() => document.body.textContent || ''")
+                html_lower = html_text.lower()
+
+                # Also detect challenges by their buttons (text may be in modal/hidden)
+                challenge_buttons = await self.browser.page.evaluate("""() => {
+                    const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent && !b.disabled);
+                    const texts = btns.map(b => b.textContent.trim().toLowerCase());
+                    return {
+                        hasTrigger: texts.some(t => t.includes('trigger mutation') || t.includes('trigger')),
+                        hasGoDeeper: texts.some(t => t.includes('go deeper') || t.includes('enter level') || t.includes('next level')),
+                        hasExtractCode: texts.some(t => t.includes('extract code')),
+                        hasRegisterSW: texts.some(t => t.includes('register service')),
+                        hasConnect: texts.some(t => t === 'connect' || t.includes('connect to')),
+                    };
+                }""")
+
+                # Handle Mutation challenge (click trigger button N times)
+                if 'mutation' in html_lower or 'trigger mutation' in html_lower or (challenge_buttons and challenge_buttons.get('hasTrigger')):
+                    print(f"  Detected: Mutation challenge", flush=True)
+                    mut_code = await self._try_mutation_challenge()
+                    if mut_code and mut_code not in failed_codes:
+                        print(f"  Mutation code: {mut_code}", flush=True)
+                        if await self._submit_code_with_fallbacks(mut_code, step):
+                            self.metrics.end_challenge(step, True, total_tin, total_tout)
+                            print(f"  >>> PASSED (mutation) <<<", flush=True)
+                            return True
+                        failed_codes.append(mut_code)
+
+                # Handle Recursive Iframe challenge (navigate nested levels)
+                if ('iframe' in html_lower and ('level' in html_lower or 'nested' in html_lower or 'depth' in html_lower or 'recursive' in html_lower)) or \
+                   (challenge_buttons and (challenge_buttons.get('hasGoDeeper') or challenge_buttons.get('hasExtractCode'))):
+                    print(f"  Detected: Iframe challenge", flush=True)
+                    iframe_code = await self._try_iframe_challenge()
+                    if iframe_code and iframe_code not in failed_codes:
+                        print(f"  Iframe code: {iframe_code}", flush=True)
+                        if await self._submit_code_with_fallbacks(iframe_code, step):
+                            self.metrics.end_challenge(step, True, total_tin, total_tout)
+                            print(f"  >>> PASSED (iframe) <<<", flush=True)
+                            return True
+                        failed_codes.append(iframe_code)
 
                 # Handle split parts challenge
                 if 'part' in html_text.lower() and ('found' in html_text.lower() or 'collect' in html_text.lower()):
@@ -341,9 +418,8 @@ class AgentChallengeSolver:
                 # === Handle "Submit is trap" / animated button challenges ===
                 # If we detected that the normal submit button is a trap, try alternatives
                 if self.submit_is_trap:
-                    scroll_attempted = True  # Skip scroll-to-find when we know submit is trap
                     trap_elapsed = time.time() - getattr(self, 'run_start', time.time())
-                    if trap_elapsed > 280:
+                    if trap_elapsed > self.timeout - 25:
                         print(f"  Submit-is-trap: skipping, {trap_elapsed:.0f}s elapsed", flush=True)
                     else:
                         print(f"  Submit is trap - trying animated button with all codes...", flush=True)
@@ -425,15 +501,15 @@ class AgentChallengeSolver:
                             print(f"  >>> PASSED <<<", flush=True)
                             return True
 
-                # Handle "Delayed Reveal" - wait for timer (only if there's an actual countdown)
+                # Handle "Delayed Reveal" - short fallback wait (main handler runs earlier)
                 has_timer = await self.browser.page.evaluate("""() => {
                     const text = document.body.textContent || '';
                     return !!(text.match(/\\d+\\.?\\d*\\s*s(?:econds?)?\\s*remaining/i) ||
                               text.match(/delayed\\s+reveal/i));
                 }""")
                 if has_timer:
-                    await asyncio.sleep(4.0)
-                    print(f"  Waited 4.0s for delayed reveal", flush=True)
+                    await asyncio.sleep(1.5)
+                    print(f"  Waited 1.5s for delayed reveal (fallback)", flush=True)
 
                 # Extract codes right after math puzzle and delayed reveal (before scroll changes page)
                 html_fresh = await self.browser.get_html()
@@ -546,6 +622,11 @@ class AgentChallengeSolver:
             # 4. AI Agent: take screenshot, ask Gemini what to do
             print(f"  [attempt {attempt+1}] Asking Gemini...", flush=True)
 
+            # Clear popups and hide stuck modals before screenshot
+            await self._clear_popups()
+            if attempt >= 2:
+                await self._hide_stuck_modals()
+
             # Alternate scroll position for variety
             if attempt % 3 == 0:
                 await self.browser.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -580,6 +661,12 @@ class AgentChallengeSolver:
                         self.metrics.end_challenge(step, True, total_tin, total_tout)
                         print(f"  >>> PASSED <<<", flush=True)
                         return True
+                    # If submit is trap, also try animated button
+                    if self.submit_is_trap:
+                        if await self._try_animated_button_submit(code, step):
+                            self.metrics.end_challenge(step, True, total_tin, total_tout)
+                            print(f"  >>> PASSED (agent+animated) <<<", flush=True)
+                            return True
                     failed_codes.append(code)
 
             # 6. Execute the agent's suggested action
@@ -598,6 +685,12 @@ class AgentChallengeSolver:
                     self.metrics.end_challenge(step, True, total_tin, total_tout)
                     print(f"  >>> PASSED <<<", flush=True)
                     return True
+                # Animated button fallback when submit is trap
+                if self.submit_is_trap:
+                    if await self._try_animated_button_submit(code, step):
+                        self.metrics.end_challenge(step, True, total_tin, total_tout)
+                        print(f"  >>> PASSED (animated after action) <<<", flush=True)
+                        return True
                 failed_codes.append(code)
 
             # 7b. Deep extraction after action (React state may have changed)
@@ -611,6 +704,11 @@ class AgentChallengeSolver:
                         self.metrics.end_challenge(step, True, total_tin, total_tout)
                         print(f"  >>> PASSED (deep) <<<", flush=True)
                         return True
+                    if self.submit_is_trap:
+                        if await self._try_animated_button_submit(code, step):
+                            self.metrics.end_challenge(step, True, total_tin, total_tout)
+                            print(f"  >>> PASSED (deep+animated) <<<", flush=True)
+                            return True
                     failed_codes.append(code)
 
             # 8. Check progress
@@ -668,7 +766,7 @@ class AgentChallengeSolver:
                 if 'audio' in html_text.lower() and 'play' in html_text.lower():
                     await self._try_audio_challenge()
                 if 'delayed' in html_text.lower() and 'remaining' in html_text.lower():
-                    await asyncio.sleep(5.5)
+                    await asyncio.sleep(2.0)
                 has_canvas = await self.browser.page.evaluate("() => !!document.querySelector('canvas')")
                 if has_canvas:
                     await self._try_canvas_challenge()
@@ -680,13 +778,53 @@ class AgentChallengeSolver:
                 }""")
                 if fill_count >= 0 and fill_count < 6:
                     await self._try_mouse_drag_and_drop()
+                # Re-try mutation challenge
+                html_text = await self.browser.page.evaluate("() => document.body.textContent || ''")
+                html_lower = html_text.lower()
+                if 'mutation' in html_lower or 'trigger mutation' in html_lower:
+                    mut_code = await self._try_mutation_challenge()
+                    if mut_code and mut_code not in failed_codes:
+                        print(f"  Mutation code: {mut_code}", flush=True)
+                        if await self._submit_code_with_fallbacks(mut_code, step):
+                            self.metrics.end_challenge(step, True, total_tin, total_tout)
+                            print(f"  >>> PASSED (mutation) <<<", flush=True)
+                            return True
+                        failed_codes.append(mut_code)
+                # Re-try iframe challenge
+                if 'iframe' in html_lower and ('level' in html_lower or 'nested' in html_lower or 'depth' in html_lower):
+                    iframe_code = await self._try_iframe_challenge()
+                    if iframe_code and iframe_code not in failed_codes:
+                        print(f"  Iframe code: {iframe_code}", flush=True)
+                        if await self._submit_code_with_fallbacks(iframe_code, step):
+                            self.metrics.end_challenge(step, True, total_tin, total_tout)
+                            print(f"  >>> PASSED (iframe) <<<", flush=True)
+                            return True
+                        failed_codes.append(iframe_code)
+                # Re-try shadow DOM challenge
+                if 'shadow' in html_lower and ('level' in html_lower or 'layer' in html_lower):
+                    shadow_code = await self._try_shadow_dom_challenge()
+                    if shadow_code and shadow_code not in failed_codes:
+                        if await self._submit_code_with_fallbacks(shadow_code, step):
+                            self.metrics.end_challenge(step, True, total_tin, total_tout)
+                            print(f"  >>> PASSED (shadow DOM retry) <<<", flush=True)
+                            return True
+                        failed_codes.append(shadow_code)
+                # Re-try websocket challenge
+                if 'websocket' in html_lower or ('connect' in html_lower and 'server' in html_lower):
+                    ws_code = await self._try_websocket_challenge()
+                    if ws_code and ws_code not in failed_codes:
+                        if await self._submit_code_with_fallbacks(ws_code, step):
+                            self.metrics.end_challenge(step, True, total_tin, total_tout)
+                            print(f"  >>> PASSED (websocket retry) <<<", flush=True)
+                            return True
+                        failed_codes.append(ws_code)
                 # Re-extract codes
                 html = await self.browser.get_html()
                 new_codes = extract_hidden_codes(html)
                 for code in new_codes:
                     if code in failed_codes:
                         continue
-                    if await self._fill_and_submit(code, step):
+                    if await self._submit_code_with_fallbacks(code, step):
                         self.metrics.end_challenge(step, True, total_tin, total_tout)
                         print(f"  >>> PASSED <<<", flush=True)
                         return True
@@ -716,6 +854,15 @@ class AgentChallengeSolver:
             if len(html) > 1000 and ("button" in html.lower() or "input" in html.lower()):
                 return True
             await asyncio.sleep(0.5)
+        return False
+
+    async def _submit_code_with_fallbacks(self, code: str, step: int) -> bool:
+        """Try to submit code: fill_and_submit first, then animated button if trap."""
+        if await self._fill_and_submit(code, step):
+            return True
+        if self.submit_is_trap:
+            if await self._try_animated_button_submit(code, step):
+                return True
         return False
 
     def _check_progress(self, url: str, step: int) -> bool:
@@ -1640,15 +1787,25 @@ class AgentChallengeSolver:
         """Hide any modals that are blocking the page after failed radio attempts."""
         return await self.browser.page.evaluate("""() => {
             let hidden = 0;
-            document.querySelectorAll('.fixed').forEach(el => {
+            // Hide radio/option modals (fixed overlays)
+            document.querySelectorAll('.fixed, [role="dialog"], [class*="modal"]').forEach(el => {
                 const text = el.textContent || '';
                 if ((text.includes('Please Select') || text.includes('Submit & Continue') ||
                      text.includes('Submit and Continue') || text.includes('Select an Option') ||
-                     (el.querySelector('input[type="radio"]') && text.includes('Submit'))) &&
+                     text.includes('RADIO MODAL') || text.includes('radio button') ||
+                     (el.querySelector('input[type="radio"]') && text.includes('Submit')) ||
+                     (el.querySelector('[role="radio"]') && text.includes('Submit'))) &&
                     !el.querySelector('input[type="text"]')) {
                     el.style.display = 'none';
                     el.style.visibility = 'hidden';
                     el.style.pointerEvents = 'none';
+                    hidden++;
+                }
+            });
+            // Also hide any fixed overlay that blocks interaction
+            document.querySelectorAll('.fixed.inset-0').forEach(el => {
+                if (el.querySelector('input[type="radio"]') || el.querySelector('[role="radio"]')) {
+                    el.style.display = 'none';
                     hidden++;
                 }
             });
@@ -2900,6 +3057,510 @@ class AgentChallengeSolver:
             return None
         except Exception as e:
             print(f"  Service Worker error: {e}", flush=True)
+            return None
+
+    async def _try_shadow_dom_challenge(self) -> str | None:
+        """Handle Shadow DOM Challenge: click through nested layers to reveal code."""
+        try:
+            for click_round in range(10):
+                result = await self.browser.page.evaluate("""() => {
+                    const text = document.body.textContent || '';
+                    // Check if code already revealed
+                    const codeMatch = text.match(/(?:code|Code)[^:]*:\\s*([A-Z0-9]{6})/);
+                    if (codeMatch) return {done: true, code: codeMatch[1]};
+                    
+                    // Check completion progress  
+                    const progressMatch = text.match(/(\\d+)\\/(\\d+)\\s*(?:levels?|layers?)/i);
+                    const current = progressMatch ? parseInt(progressMatch[1]) : 0;
+                    const total = progressMatch ? parseInt(progressMatch[2]) : 3;
+                    
+                    // If all levels done, click reveal/complete button
+                    if (current >= total) {
+                        for (const btn of document.querySelectorAll('button')) {
+                            const t = (btn.textContent || '').trim().toLowerCase();
+                            if ((t.includes('reveal') || t.includes('complete') || t.includes('extract')) && 
+                                !btn.disabled && btn.offsetParent) {
+                                btn.click();
+                                return {clicked: 'reveal_btn', current, total};
+                            }
+                        }
+                    }
+                    
+                    // Strategy: find all divs with cursor-pointer that have a DIRECT text
+                    // starting with "Shadow Level N" (not inherited from children)
+                    const candidates = [...document.querySelectorAll('div')].filter(el => {
+                        const cls = el.getAttribute('class') || '';
+                        if (!cls.includes('cursor-pointer') && !cls.includes('cursor_pointer')) return false;
+                        if (!el.offsetParent || el.offsetWidth < 30) return false;
+                        // Get only direct text nodes (not from children)
+                        let directText = '';
+                        for (const node of el.childNodes) {
+                            if (node.nodeType === 3) directText += node.textContent;
+                        }
+                        directText = directText.trim();
+                        if (!directText) {
+                            // Maybe first child is a span/strong with the label
+                            const first = el.children[0];
+                            if (first && first.tagName !== 'DIV') directText = first.textContent.trim();
+                        }
+                        return /^(?:Shadow\\s+)?Level\\s+\\d/i.test(directText);
+                    });
+                    
+                    // Click first un-completed level
+                    for (const el of candidates) {
+                        const cls = el.getAttribute('class') || '';
+                        const allText = el.textContent || '';
+                        if (!cls.includes('green') && !allText.startsWith('✓') && 
+                            !allText.includes('✓ Shadow') && !allText.includes('✓Shadow')) {
+                            // Get label from direct text only
+                            let label = '';
+                            for (const node of el.childNodes) {
+                                if (node.nodeType === 3) label += node.textContent;
+                            }
+                            el.click();
+                            return {clicked: (label || 'level').trim().substring(0, 30), current, total};
+                        }
+                    }
+                    
+                    // Fallback: any slate div that looks like a level
+                    for (const el of document.querySelectorAll('div[class*="slate"]')) {
+                        const cls = el.getAttribute('class') || '';
+                        if (!cls.includes('cursor') && !cls.includes('hover')) continue;
+                        if (cls.includes('green')) continue;
+                        if (!el.offsetParent || el.offsetWidth < 30) continue;
+                        // Check that this div is small enough to be a level box (< 500 chars direct)
+                        let directLen = 0;
+                        for (const node of el.childNodes) {
+                            if (node.nodeType === 3) directLen += node.textContent.trim().length;
+                        }
+                        if (directLen > 0 && directLen < 50) {
+                            el.click();
+                            return {clicked: 'slate-fallback', current, total};
+                        }
+                    }
+                    
+                    return {clicked: null, current, total};
+                }""")
+                
+                if not result:
+                    break
+                if result.get('done') and result.get('code'):
+                    from dom_parser import FALSE_POSITIVES
+                    code = result['code']
+                    if code not in FALSE_POSITIVES:
+                        print(f"  Shadow DOM: code={code} after {click_round+1} clicks", flush=True)
+                        return code
+                if result.get('clicked'):
+                    print(f"  Shadow DOM: {result['clicked']} ({result.get('current',0)}/{result.get('total',3)})", flush=True)
+                    await asyncio.sleep(0.4)
+                else:
+                    break
+            
+            # Final extraction attempt
+            code = await self.browser.page.evaluate("""() => {
+                const text = document.body.textContent || '';
+                const m = text.match(/(?:code|Code)[^:]*:\\s*([A-Z0-9]{6})/);
+                return m ? m[1] : null;
+            }""")
+            if code:
+                from dom_parser import FALSE_POSITIVES
+                if code not in FALSE_POSITIVES:
+                    return code
+            return None
+        except Exception as e:
+            print(f"  Shadow DOM error: {e}", flush=True)
+            return None
+
+    async def _try_websocket_challenge(self) -> str | None:
+        """Handle WebSocket Challenge: click Connect, wait for messages, click Reveal, extract code."""
+        try:
+            # Step 1: Click Connect button
+            connected = await self.browser.page.evaluate("""() => {
+                const text = document.body.textContent || '';
+                if (text.includes('Connected') || text.includes('● Connected')) return 'already';
+                for (const btn of document.querySelectorAll('button')) {
+                    const t = (btn.textContent || '').trim().toLowerCase();
+                    if ((t.includes('connect') || t === 'connect') && !btn.disabled && btn.offsetParent) {
+                        btn.click();
+                        return 'clicked';
+                    }
+                }
+                return null;
+            }""")
+            if not connected:
+                return None
+            print(f"  WebSocket: connect={connected}", flush=True)
+            
+            # Step 2: Wait for connection + messages + Reveal Code button
+            for i in range(25):
+                await asyncio.sleep(0.5)
+                status = await self.browser.page.evaluate("""() => {
+                    const text = document.body.textContent || '';
+                    if (text.match(/\\b[A-Z0-9]{6}\\b/) && (text.includes('code') || text.includes('Code'))) return 'has_code';
+                    // Check for Reveal Code button
+                    for (const btn of document.querySelectorAll('button')) {
+                        const t = (btn.textContent || '').trim().toLowerCase();
+                        if (t.includes('reveal') && !btn.disabled && btn.offsetParent) return 'ready';
+                    }
+                    if (text.includes('Ready to reveal') || text.includes('reveal code')) return 'ready';
+                    if (text.includes('Connected') || text.includes('● Connected')) return 'connected';
+                    return 'waiting';
+                }""")
+                if status == 'has_code' or status == 'ready':
+                    break
+                if status == 'connected' and i > 10:  # Wait up to 5s after connected
+                    break
+            
+            # Step 3: Click Reveal Code / Request / Send buttons (with retries)
+            for reveal_attempt in range(5):
+                clicked = await self.browser.page.evaluate("""() => {
+                    for (const btn of document.querySelectorAll('button')) {
+                        const t = (btn.textContent || '').trim().toLowerCase();
+                        if ((t.includes('reveal') || t.includes('request') || t.includes('get code') ||
+                             t.includes('send') || t.includes('extract')) && 
+                            !t.includes('connect') && !btn.disabled && btn.offsetParent) {
+                            btn.click();
+                            return t.substring(0, 30);
+                        }
+                    }
+                    return null;
+                }""")
+                if clicked:
+                    print(f"  WebSocket: clicked '{clicked}'", flush=True)
+                    await asyncio.sleep(0.8)
+                else:
+                    await asyncio.sleep(0.5)
+                    continue
+                
+                # Try to extract code immediately after clicking
+                code = await self.browser.page.evaluate("""() => {
+                    const text = document.body.textContent || '';
+                    for (const el of document.querySelectorAll('.text-green-600, .text-green-700, .bg-green-100, .bg-green-50')) {
+                        const m = (el.textContent || '').match(/\\b([A-Z0-9]{6})\\b/);
+                        if (m) return m[1];
+                    }
+                    const m = text.match(/(?:code|Code|CODE)[^:]*?:\\s*([A-Z0-9]{6})/);
+                    if (m) return m[1];
+                    for (const el of document.querySelectorAll('[class*="cyan"], [class*="terminal"], pre, code, [class*="mono"]')) {
+                        const m2 = (el.textContent || '').match(/\\b([A-Z0-9]{6})\\b/);
+                        if (m2) return m2[1];
+                    }
+                    return null;
+                }""")
+                if code:
+                    from dom_parser import FALSE_POSITIVES
+                    if code not in FALSE_POSITIVES:
+                        print(f"  WebSocket: code={code}", flush=True)
+                        return code
+            
+            print(f"  WebSocket: no code found", flush=True)
+            return None
+        except Exception as e:
+            print(f"  WebSocket error: {e}", flush=True)
+            return None
+
+    async def _try_delayed_reveal(self) -> str | None:
+        """Handle Delayed Reveal Challenge: wait for timer to complete, extract code."""
+        try:
+            # Check timer remaining
+            for i in range(25):
+                result = await self.browser.page.evaluate("""() => {
+                    const text = document.body.textContent || '';
+                    // Check if code already revealed
+                    const codeMatch = text.match(/(?:code|Code|challenge code)[^:]*:\\s*([A-Z0-9]{6})/i);
+                    if (codeMatch) return {code: codeMatch[1]};
+                    // Check for any 6-char code in revealed/success area
+                    const greens = document.querySelectorAll('.text-green-600, .bg-green-100, .bg-blue-100, .bg-purple-100');
+                    for (const el of greens) {
+                        const m = (el.textContent || '').match(/\\b([A-Z0-9]{6})\\b/);
+                        if (m) return {code: m[1]};
+                    }
+                    // Check timer
+                    const timerMatch = text.match(/(\\d+\\.?\\d*)\\s*s(?:econds?)?\\s*remaining/i);
+                    const remaining = timerMatch ? parseFloat(timerMatch[1]) : null;
+                    const done = text.includes('revealed') || text.includes('Complete') || text.includes('100%');
+                    return {remaining, done};
+                }""")
+                if result and result.get('code'):
+                    from dom_parser import FALSE_POSITIVES
+                    code = result['code']
+                    if code not in FALSE_POSITIVES:
+                        print(f"  Delayed Reveal: code={code} after {i*0.4:.1f}s", flush=True)
+                        return code
+                if result and result.get('done'):
+                    await asyncio.sleep(0.3)
+                    continue  # One more loop to extract code
+                if result and result.get('remaining') is not None and result['remaining'] < 0.5:
+                    await asyncio.sleep(0.6)
+                    continue
+                await asyncio.sleep(0.4)
+            
+            # Final extraction
+            code = await self.browser.page.evaluate("""() => {
+                const text = document.body.textContent || '';
+                // Broad code search near "code" or "revealed"
+                const matches = text.match(/\\b([A-Z0-9]{6})\\b/g) || [];
+                const known = new Set(['FILLER', 'SUBMIT', 'BUTTON', 'SCROLL', 'REVEAL']);
+                return matches.find(m => !known.has(m) && /[0-9]/.test(m)) || null;
+            }""")
+            if code:
+                from dom_parser import FALSE_POSITIVES
+                if code not in FALSE_POSITIVES:
+                    print(f"  Delayed Reveal: code={code} (final)", flush=True)
+                    return code
+            print(f"  Delayed Reveal: no code found", flush=True)
+            return None
+        except Exception as e:
+            print(f"  Delayed Reveal error: {e}", flush=True)
+            return None
+
+    async def _try_mutation_challenge(self) -> str | None:
+        """Handle DOM Mutation Challenge: click Trigger Mutation button N times, then Complete."""
+        try:
+            # Scroll mutation challenge into view first
+            await self.browser.page.evaluate("""() => {
+                for (const el of document.querySelectorAll('div, h2, h3, p')) {
+                    const t = (el.textContent || '').substring(0, 200);
+                    if (t.includes('Mutation Challenge') || t.includes('Trigger Mutation')) {
+                        el.scrollIntoView({behavior: 'instant', block: 'center'});
+                        break;
+                    }
+                }
+            }""")
+            await asyncio.sleep(0.2)
+            
+            for click_round in range(12):
+                result = await self.browser.page.evaluate("""() => {
+                    const text = document.body.textContent || '';
+                    // Check if code revealed
+                    const codeMatch = text.match(/(?:code|Code)[^:]*:\\s*([A-Z0-9]{6})/);
+                    if (codeMatch) return {done: true, code: codeMatch[1]};
+                    
+                    // Check progress - multiple patterns
+                    let current = 0, total = 5;
+                    const m1 = text.match(/(\\d+)\\/(\\d+)\\s*(?:mutations?|triggered|complete)/i);
+                    const m2 = text.match(/(\\d+)\\/((\\d+))/);  // bare N/M
+                    const m3 = text.match(/Mutations?[^:]*?:\\s*(\\d+)\\/(\\d+)/i);
+                    const match = m1 || m3 || m2;
+                    if (match) { current = parseInt(match[1]); total = parseInt(match[2]); }
+                    
+                    // Find trigger/complete buttons with coordinates for Playwright click
+                    const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent && !b.disabled);
+                    let triggerBtn = null, completeBtn = null;
+                    for (const btn of btns) {
+                        const t = (btn.textContent || '').trim().toLowerCase();
+                        if (t.includes('trigger') && !t.includes('submit')) {
+                            const r = btn.getBoundingClientRect();
+                            triggerBtn = {x: r.x + r.width/2, y: r.y + r.height/2, text: t.substring(0, 30)};
+                        }
+                        if ((t.includes('complete') || t.includes('finish') || t.includes('reveal')) && 
+                            !t.includes('submit') && !t.includes('trigger')) {
+                            const r = btn.getBoundingClientRect();
+                            completeBtn = {x: r.x + r.width/2, y: r.y + r.height/2, text: t.substring(0, 30)};
+                        }
+                    }
+                    
+                    return {current, total, triggerBtn, completeBtn};
+                }""")
+                
+                if not result:
+                    break
+                if result.get('done') and result.get('code'):
+                    from dom_parser import FALSE_POSITIVES
+                    code = result['code']
+                    if code not in FALSE_POSITIVES:
+                        print(f"  Mutation: code={code} after {click_round+1} clicks", flush=True)
+                        return code
+                
+                current = result.get('current', 0)
+                total = result.get('total', 5)
+                
+                # If complete, use Playwright click on Complete button
+                if current >= total and result.get('completeBtn'):
+                    btn = result['completeBtn']
+                    print(f"  Mutation: clicking complete ({current}/{total})", flush=True)
+                    await self.browser.page.mouse.click(btn['x'], btn['y'])
+                    await asyncio.sleep(0.5)
+                    continue
+                
+                # Use Playwright mouse click on Trigger button
+                if result.get('triggerBtn'):
+                    btn = result['triggerBtn']
+                    print(f"  Mutation: trigger ({current}/{total})", flush=True)
+                    await self.browser.page.mouse.click(btn['x'], btn['y'])
+                    await asyncio.sleep(0.3)
+                else:
+                    break
+            
+            # Final extraction - broader search
+            code = await self.browser.page.evaluate("""() => {
+                const text = document.body.textContent || '';
+                const m = text.match(/(?:code|Code)[^:]*:\\s*([A-Z0-9]{6})/);
+                if (m) return m[1];
+                for (const el of document.querySelectorAll('.text-green-600, .bg-green-100, .bg-rose-100, [class*="success"]')) {
+                    const cm = (el.textContent || '').match(/\\b([A-Z0-9]{6})\\b/);
+                    if (cm) return cm[1];
+                }
+                return null;
+            }""")
+            if code:
+                from dom_parser import FALSE_POSITIVES
+                if code not in FALSE_POSITIVES:
+                    return code
+            return None
+        except Exception as e:
+            print(f"  Mutation error: {e}", flush=True)
+            return None
+
+    async def _try_iframe_challenge(self) -> str | None:
+        """Handle Recursive Iframe Challenge: navigate through N nested levels, extract code."""
+        try:
+            extract_attempts = 0
+            for click_round in range(15):
+                # CRITICAL: First scroll the iframe challenge into view
+                # Elements may be scrolled off-screen (negative y coords)
+                await self.browser.page.evaluate("""() => {
+                    // Find the iframe challenge container and scroll it into view
+                    for (const el of document.querySelectorAll('div')) {
+                        const t = (el.textContent || '').substring(0, 200);
+                        if (t.includes('Iframe Challenge') || t.includes('Recursive Iframe')) {
+                            el.scrollIntoView({behavior: 'instant', block: 'center'});
+                            break;
+                        }
+                    }
+                    // Also try scrolling Extract Code button into view if it exists
+                    const extractBtn = [...document.querySelectorAll('button')].find(
+                        b => b.textContent.trim().toLowerCase().includes('extract'));
+                    if (extractBtn) extractBtn.scrollIntoView({behavior: 'instant', block: 'center'});
+                }""")
+                await asyncio.sleep(0.2)
+                
+                result = await self.browser.page.evaluate("""() => {
+                    const text = document.body.textContent || '';
+                    
+                    // Check for revealed code
+                    const codeEls = document.querySelectorAll('.text-green-600, .text-green-700, .bg-green-100, .bg-green-50, .bg-emerald-100, .text-emerald-600, [class*="success"]');
+                    for (const el of codeEls) {
+                        const m = (el.textContent || '').match(/\\b([A-Z0-9]{6})\\b/);
+                        if (m && !['IFRAME','BWRONG','1WRONG'].includes(m[1])) return {done: true, code: m[1], source: 'green'};
+                    }
+                    const codeMatch = text.match(/(?:code|Code)[^:]*?:\\s*([A-Z0-9]{6})/);
+                    if (codeMatch && !['IFRAME','BWRONG','1WRONG'].includes(codeMatch[1])) return {done: true, code: codeMatch[1], source: 'text'};
+                    
+                    // Check depth
+                    const depthMatch = text.match(/(?:depth|level)[^:]*?:\\s*(\\d+)\\/(\\d+)/i) ||
+                                       text.match(/(\\d+)\\/(\\d+)\\s*(?:depth|levels?)/i);
+                    const current = depthMatch ? parseInt(depthMatch[1]) : 0;
+                    const total = depthMatch ? parseInt(depthMatch[2]) : 4;
+                    
+                    // PRIORITY 1: Find incomplete level divs (green, not emerald = incomplete)
+                    // Completed levels: bg-emerald-50, Incomplete: bg-green-50 or no emerald
+                    let incompleteLevelDiv = null;
+                    const levelDivs = document.querySelectorAll('div[class*="border-2"][class*="rounded"]');
+                    for (const div of levelDivs) {
+                        const cls = div.getAttribute('class') || '';
+                        const firstText = (div.childNodes[0]?.textContent || '').trim();
+                        if (/(?:Iframe\\s+)?Level\\s+\\d/i.test(firstText) && 
+                            !firstText.includes('✓') && !firstText.includes('✔') &&
+                            !cls.includes('emerald') &&
+                            div.offsetParent && div.offsetWidth > 50) {
+                            const r = div.getBoundingClientRect();
+                            incompleteLevelDiv = {x: r.x + r.width/2, y: r.y + r.height/2, text: firstText, w: r.width, h: r.height};
+                        }
+                    }
+                    
+                    // Find buttons with coordinates
+                    const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent && !b.disabled);
+                    let enterBtn = null, extractBtn = null;
+                    
+                    for (const btn of btns) {
+                        const t = (btn.textContent || '').trim().toLowerCase();
+                        const r = btn.getBoundingClientRect();
+                        if (r.width === 0 && r.height === 0) continue; // hidden
+                        const coord = {x: r.x + r.width/2, y: r.y + r.height/2, text: t.substring(0, 30)};
+                        
+                        if ((t.includes('go deeper') || t.includes('enter level') || t.includes('next level') ||
+                             t.includes('descend') || t.includes('open level')) &&
+                            !t.includes('submit') && !t.includes('extract')) {
+                            enterBtn = coord;
+                        }
+                        if (t.includes('extract') || (t.includes('reveal') && !t.includes('submit'))) {
+                            extractBtn = coord;
+                        }
+                    }
+                    
+                    const atDeepest = text.includes('deepest level') || text.includes('reached the deepest');
+                    return {current, total, enterBtn, extractBtn, incompleteLevelDiv, atDeepest};
+                }""")
+                
+                if not result:
+                    break
+                if result.get('done') and result.get('code'):
+                    from dom_parser import FALSE_POSITIVES
+                    code = result['code']
+                    if code not in FALSE_POSITIVES:
+                        print(f"  Iframe: code={code} ({result.get('source','?')}) after {click_round+1} clicks", flush=True)
+                        return code
+                
+                current = result.get('current', 0)
+                total = result.get('total', 4)
+                
+                # PRIORITY 1: Click incomplete level divs (e.g. "Iframe Level 5" without ✓)
+                if result.get('incompleteLevelDiv'):
+                    target = result['incompleteLevelDiv']
+                    print(f"  Iframe: clicking incomplete level '{target['text']}' ({current}/{total})", flush=True)
+                    await self.browser.page.mouse.click(target['x'], target['y'])
+                    extract_attempts = 0
+                    await asyncio.sleep(0.4)
+                    continue
+                
+                # PRIORITY 2: Click Enter Level buttons
+                if current < total and result.get('enterBtn'):
+                    target = result['enterBtn']
+                    print(f"  Iframe: clicking {target['text']} ({current}/{total})", flush=True)
+                    await self.browser.page.mouse.click(target['x'], target['y'])
+                    extract_attempts = 0
+                    await asyncio.sleep(0.3)
+                    continue
+                
+                # PRIORITY 3: Extract code (current >= total or at deepest)
+                if result.get('extractBtn') and (current >= total or result.get('atDeepest')):
+                    extract_attempts += 1
+                    if extract_attempts > 3:
+                        print(f"  Iframe: Extract clicked {extract_attempts}x with no code, bailing", flush=True)
+                        break
+                    btn = result['extractBtn']
+                    print(f"  Iframe: extract ({current}/{total})", flush=True)
+                    await self.browser.page.mouse.click(btn['x'], btn['y'])
+                    await asyncio.sleep(0.8)
+                    continue
+                
+                # Nothing worked
+                print(f"  Iframe: nothing to click ({current}/{total}, deepest={result.get('atDeepest')})", flush=True)
+                break
+            
+            # Final broad extraction - search entire page for 6-char codes near iframe area
+            code = await self.browser.page.evaluate("""() => {
+                const text = document.body.textContent || '';
+                // Look for code pattern near "extracted" or "code" text
+                const m = text.match(/(?:code|Code|extracted)[^:]*?:\\s*([A-Z0-9]{6})/);
+                if (m) return m[1];
+                // Look in any element with dashed border or green styling
+                for (const el of document.querySelectorAll('[class*="dashed"], [class*="green"], [class*="emerald"]')) {
+                    const t = (el.textContent || '').trim();
+                    const cm = t.match(/\\b([A-Z0-9]{6})\\b/);
+                    if (cm && t.length < 200) return cm[1];
+                }
+                return null;
+            }""")
+            if code:
+                from dom_parser import FALSE_POSITIVES
+                if code not in FALSE_POSITIVES:
+                    print(f"  Iframe: code={code} (final extraction)", flush=True)
+                    return code
+            return None
+        except Exception as e:
+            print(f"  Iframe error: {e}", flush=True)
             return None
 
     async def _try_split_parts(self) -> bool:

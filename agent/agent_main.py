@@ -26,7 +26,7 @@ async def main(headless: bool = False, keep_open: bool = False):
     print(f"Keep browser open: {keep_open}")
     print("-" * 50)
 
-    solver = AgentChallengeSolver(GEMINI_API_KEY)
+    solver = AgentChallengeSolver(GEMINI_API_KEY, timeout=MAX_TIME_SECONDS)
     solver.keep_browser_open = keep_open
 
     try:
@@ -39,21 +39,6 @@ async def main(headless: bool = False, keep_open: bool = False):
         results = solver.metrics.get_summary()
         solver.metrics.print_summary()
 
-        if keep_open:
-            print("\n" + "="*60)
-            print("  BROWSER LEFT OPEN FOR DEBUGGING")
-            print("  Press Enter to close browser and exit...")
-            print("="*60 + "\n")
-            try:
-                await asyncio.get_event_loop().run_in_executor(None, input)
-            except (EOFError, KeyboardInterrupt):
-                pass
-            finally:
-                try:
-                    await solver.browser.stop()
-                except Exception:
-                    pass
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_file = f"agent_results_{timestamp}.json"
 
@@ -61,6 +46,23 @@ async def main(headless: bool = False, keep_open: bool = False):
         json.dump(results, f, indent=2)
 
     print(f"\nResults saved to: {results_file}")
+
+    # Keep browser open for manual debugging (works for both normal exit and timeout)
+    if keep_open:
+        print("\n" + "="*60)
+        print("  BROWSER LEFT OPEN FOR DEBUGGING")
+        print("  Press Enter to close browser and exit...")
+        print("="*60 + "\n")
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, input)
+        except (EOFError, KeyboardInterrupt):
+            pass
+        finally:
+            try:
+                await solver.browser.stop()
+            except Exception:
+                pass
+
     return results
 
 
