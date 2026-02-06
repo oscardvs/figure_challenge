@@ -281,6 +281,13 @@ class AgentChallengeSolver:
 
                 # Handle "Scroll Down to Find Navigation" - check headers, main container, and page structure
                 is_scroll_challenge = await self.browser.page.evaluate("""() => {
+                    // Counter-check: if other challenge types are clearly present, skip scroll detection
+                    const bodyText = (document.body.textContent || '').toLowerCase();
+                    const hasCanvas = !!document.querySelector('canvas');
+                    const hasAudio = bodyText.includes('audio challenge') || (bodyText.includes('play audio') && bodyText.includes('complete'));
+                    const hasDrag = document.querySelectorAll('[draggable="true"]').length >= 3;
+                    if (hasCanvas || hasAudio || hasDrag) return false;
+
                     // Check heading/prominent text elements for scroll instruction
                     const els = document.querySelectorAll('h1, h2, h3, .text-2xl, .text-3xl, .text-xl, .font-bold, .text-lg');
                     for (const el of els) {
@@ -294,7 +301,6 @@ class AgentChallengeSolver:
                         if (t.includes('scroll down') && (t.includes('navigation') || t.includes('navigate') || t.includes('nav button'))) return true;
                     }
                     // Check body text for scroll-related instructions
-                    const bodyText = (document.body.textContent || '').toLowerCase();
                     if (bodyText.includes('keep scrolling') && bodyText.includes('navigation button')) return true;
                     // Structural check: many sections with filler text + scroll height > 5000px
                     if (document.body.scrollHeight > 5000) {
@@ -522,6 +528,11 @@ class AgentChallengeSolver:
                 # Re-try scroll-to-find-nav, audio, canvas, etc.
                 html_text = await self.browser.page.evaluate("() => document.body.textContent || ''")
                 is_scroll_ch = await self.browser.page.evaluate("""() => {
+                    const bodyText = (document.body.textContent || '').toLowerCase();
+                    const hasCanvas = !!document.querySelector('canvas');
+                    const hasAudio = bodyText.includes('audio challenge') || (bodyText.includes('play audio') && bodyText.includes('complete'));
+                    const hasDrag = document.querySelectorAll('[draggable="true"]').length >= 3;
+                    if (hasCanvas || hasAudio || hasDrag) return false;
                     const els = document.querySelectorAll('h1, h2, h3, .text-2xl, .text-3xl, .text-xl, .font-bold, .text-lg');
                     for (const el of els) {
                         const t = (el.textContent || '').toLowerCase();
@@ -532,7 +543,6 @@ class AgentChallengeSolver:
                         const t = (mainBox.textContent || '').toLowerCase();
                         if (t.includes('scroll down') && (t.includes('navigation') || t.includes('navigate') || t.includes('nav button'))) return true;
                     }
-                    const bodyText = (document.body.textContent || '').toLowerCase();
                     if (bodyText.includes('keep scrolling') && bodyText.includes('navigation button')) return true;
                     if (document.body.scrollHeight > 5000) {
                         const sectionDivs = [...document.querySelectorAll('div')].filter(el => {
@@ -1299,6 +1309,14 @@ class AgentChallengeSolver:
         """
         try:
             print(f"  Scroll-to-find: searching...", flush=True)
+            SCROLL_TIMEOUT = 25  # Max seconds for entire scroll-to-find attempt
+            scroll_global_start = time.time()
+
+            def _scroll_time_left():
+                return SCROLL_TIMEOUT - (time.time() - scroll_global_start)
+
+            def _scroll_expired():
+                return time.time() - scroll_global_start > SCROLL_TIMEOUT
 
             # Sort codes by priority: mixed alpha+digit first (most likely real codes)
             sorted_codes = self._sort_codes_by_priority(codes_to_try) if codes_to_try else []
@@ -1337,7 +1355,7 @@ class AgentChallengeSolver:
             phase0_start = time.time()
             phase0_codes = set()  # Accumulate codes during scroll
 
-            while time.time() - phase0_start < 15:
+            while time.time() - phase0_start < 10:
                 await self.browser.page.mouse.wheel(0, 800)
                 await asyncio.sleep(0.10)
 
@@ -1431,7 +1449,10 @@ class AgentChallengeSolver:
                         return True
 
             # ===== Phase 0-deep: React state + CSS + shadow DOM + JS var extraction =====
-            deep_codes = await self._deep_code_extraction(codes_to_try)
+            if not _scroll_expired():
+                deep_codes = await self._deep_code_extraction(codes_to_try)
+            else:
+                deep_codes = []
             if deep_codes:
                 print(f"  Phase 0-deep: {len(deep_codes)} codes from React/CSS/JS: {deep_codes[:8]}", flush=True)
                 for code in deep_codes[:10]:
@@ -1441,65 +1462,71 @@ class AgentChallengeSolver:
 
             # ===== Phase 0-slow: Slow incremental scroll with pauses =====
             # Some IntersectionObservers need the element visible for a minimum duration.
-            print(f"  Scroll-to-find: phase 0-slow - incremental scroll...", flush=True)
-            await _fill_best_code()  # Ensure best code is in input
-            await self.browser.page.evaluate("window.scrollTo(0, 0)")
-            await asyncio.sleep(0.2)
-            total_h = await self.browser.page.evaluate("() => document.body.scrollHeight")
-            slow_step = 400
-            slow_start = time.time()
-            prev_y = 0
-            for pos in range(0, total_h + slow_step, slow_step):
-                if time.time() - slow_start > 20:
-                    break
-                await self.browser.page.mouse.wheel(0, slow_step)
-                await asyncio.sleep(0.25)
-                url = await self.browser.get_url()
-                if self._check_progress(url, self.current_step):
-                    print(f"  Phase 0-slow: auto-nav at ~{pos}px!", flush=True)
-                    return True
-                cur_y = await self.browser.page.evaluate("() => window.scrollY")
-                if cur_y <= prev_y and prev_y > 100:
-                    break
-                prev_y = cur_y
-
-            # After slow scroll, deep extract again (scroll may have populated React state)
-            deep2 = await self._deep_code_extraction(codes_to_try)
-            new_deep = [c for c in deep2 if c not in (deep_codes or [])]
-            if new_deep:
-                print(f"  Phase 0-slow: {len(new_deep)} NEW codes after scroll: {new_deep[:5]}", flush=True)
-                for code in new_deep[:5]:
-                    if await self._fill_and_submit(code, self.current_step):
-                        return True
-
-            # ===== Phase 0-sections: scrollIntoView each section =====
-            await _fill_best_code()  # Re-fill best code
-            section_count = await self.browser.page.evaluate("""() => {
-                return [...document.querySelectorAll('div')].filter(el => {
-                    const t = (el.textContent || '').trim();
-                    return t.match(/^Section \\d+/) && t.length > 30;
-                }).length;
-            }""")
-            if section_count > 10:
-                print(f"  Phase 0-sections: scrolling {section_count} sections...", flush=True)
-                sec_start = time.time()
-                for i in range(section_count):
-                    if time.time() - sec_start > 15:
+            if not _scroll_expired():
+                print(f"  Scroll-to-find: phase 0-slow - incremental scroll...", flush=True)
+                await _fill_best_code()  # Ensure best code is in input
+                await self.browser.page.evaluate("window.scrollTo(0, 0)")
+                await asyncio.sleep(0.2)
+                total_h = await self.browser.page.evaluate("() => document.body.scrollHeight")
+                slow_step = 400
+                slow_start = time.time()
+                prev_y = 0
+                for pos in range(0, total_h + slow_step, slow_step):
+                    if time.time() - slow_start > 8 or _scroll_expired():
                         break
-                    await self.browser.page.evaluate(f"""(idx) => {{
-                        const secs = [...document.querySelectorAll('div')].filter(el => {{
-                            const t = (el.textContent || '').trim();
-                            return t.match(/^Section \\d+/) && t.length > 30;
-                        }});
-                        if (idx < secs.length) secs[idx].scrollIntoView({{behavior: 'smooth', block: 'center'}});
-                    }}""", i)
-                    await asyncio.sleep(0.15)
+                    await self.browser.page.mouse.wheel(0, slow_step)
+                    await asyncio.sleep(0.25)
                     url = await self.browser.get_url()
                     if self._check_progress(url, self.current_step):
-                        print(f"  Phase 0-sections: auto-nav at section {i}!", flush=True)
+                        print(f"  Phase 0-slow: auto-nav at ~{pos}px!", flush=True)
                         return True
+                    cur_y = await self.browser.page.evaluate("() => window.scrollY")
+                    if cur_y <= prev_y and prev_y > 100:
+                        break
+                    prev_y = cur_y
+
+            # After slow scroll, deep extract again (scroll may have populated React state)
+            if not _scroll_expired():
+                deep2 = await self._deep_code_extraction(codes_to_try)
+                new_deep = [c for c in deep2 if c not in (deep_codes or [])]
+                if new_deep:
+                    print(f"  Phase 0-slow: {len(new_deep)} NEW codes after scroll: {new_deep[:5]}", flush=True)
+                    for code in new_deep[:5]:
+                        if await self._fill_and_submit(code, self.current_step):
+                            return True
+
+            # ===== Phase 0-sections: scrollIntoView each section =====
+            if not _scroll_expired():
+                await _fill_best_code()  # Re-fill best code
+                section_count = await self.browser.page.evaluate("""() => {
+                    return [...document.querySelectorAll('div')].filter(el => {
+                        const t = (el.textContent || '').trim();
+                        return t.match(/^Section \\d+/) && t.length > 30;
+                    }).length;
+                }""")
+                if section_count > 10:
+                    print(f"  Phase 0-sections: scrolling {section_count} sections...", flush=True)
+                    sec_start = time.time()
+                    for i in range(section_count):
+                        if time.time() - sec_start > 6 or _scroll_expired():
+                            break
+                        await self.browser.page.evaluate(f"""(idx) => {{
+                            const secs = [...document.querySelectorAll('div')].filter(el => {{
+                                const t = (el.textContent || '').trim();
+                                return t.match(/^Section \\d+/) && t.length > 30;
+                            }});
+                            if (idx < secs.length) secs[idx].scrollIntoView({{behavior: 'smooth', block: 'center'}});
+                        }}""", i)
+                        await asyncio.sleep(0.15)
+                        url = await self.browser.get_url()
+                        if self._check_progress(url, self.current_step):
+                            print(f"  Phase 0-sections: auto-nav at section {i}!", flush=True)
+                            return True
 
             # ===== Phase 0a: Scrollable containers =====
+            if _scroll_expired():
+                await self.browser.page.evaluate("window.scrollTo(0, 0)")
+                return False
             # The scroll listener might be on a nested div, not the window
             containers = await self.browser.page.evaluate("""() => {
                 const results = [];
@@ -1604,6 +1631,9 @@ class AgentChallengeSolver:
                     return True
 
             # ===== Phase 0b: Keyboard scrolling =====
+            if _scroll_expired():
+                await self.browser.page.evaluate("window.scrollTo(0, 0)")
+                return False
             # End key fires both keyboard AND scroll events; PageDown fires scroll events
             print(f"  Scroll-to-find: phase 0b - keyboard scrolling...", flush=True)
             await self.browser.page.evaluate("window.scrollTo(0, 0)")
@@ -1655,6 +1685,9 @@ class AgentChallengeSolver:
                     return True
 
             # ===== Phase 0c: Synthetic event dispatch =====
+            if _scroll_expired():
+                await self.browser.page.evaluate("window.scrollTo(0, 0)")
+                return False
             # Dispatch scroll AND wheel events on all targets after programmatic scroll
             print(f"  Scroll-to-find: phase 0c - synthetic events...", flush=True)
             await self.browser.page.evaluate("""() => {
@@ -1699,6 +1732,9 @@ class AgentChallengeSolver:
                     return True
 
             # ===== Existing fallback phases (scrollTo-based) =====
+            if _scroll_expired():
+                await self.browser.page.evaluate("window.scrollTo(0, 0)")
+                return False
             total_h = await self.browser.page.evaluate("() => document.body.scrollHeight")
             step_px = 800
 
@@ -1779,6 +1815,9 @@ class AgentChallengeSolver:
 
             # Phase 3: Fast full-page button scan
             # Step A: Thorough scroll with mouse.wheel to trigger rendering + fire events
+            if _scroll_expired():
+                await self.browser.page.evaluate("window.scrollTo(0, 0)")
+                return False
             await _fill_best_code()  # Ensure correct code in input before clicking buttons
             total_h = await self.browser.page.evaluate("() => document.body.scrollHeight")
             await self.browser.page.evaluate("window.scrollTo(0, 0)")
@@ -1880,6 +1919,9 @@ class AgentChallengeSolver:
 
             # Phase 4: Playwright-native clicks + code accumulation during scroll
             # Extract codes at each scroll position (virtualized content only exists in viewport)
+            if _scroll_expired():
+                await self.browser.page.evaluate("window.scrollTo(0, 0)")
+                return False
             await _fill_best_code()  # Ensure correct code in input
             print(f"  Scroll-to-find: phase 4 - Playwright native clicks...", flush=True)
             total_h = await self.browser.page.evaluate("() => document.body.scrollHeight")
@@ -1887,11 +1929,12 @@ class AgentChallengeSolver:
             all_labels = []
             accumulated_codes = set()
             phase4_start = time.time()
+            phase4_limit = min(12, _scroll_time_left())  # Reduced from 25s
             await self.browser.page.evaluate("window.scrollTo(0, 0)")
             await asyncio.sleep(0.1)
             scroll_pos = 0
             while scroll_pos < total_h + 800:
-                if time.time() - phase4_start > 25:
+                if time.time() - phase4_start > phase4_limit:
                     print(f"  Scroll-to-find: phase 4 time limit ({clicked} clicks)", flush=True)
                     break
                 # Use mouse.wheel for real event firing
@@ -2008,11 +2051,12 @@ class AgentChallengeSolver:
 
             # Phase 6: Find non-standard React onClick elements (divs, spans, etc.)
             # Only scan non-button/non-link elements since Phase 4 covered those
-            print(f"  Scroll-to-find: phase 6 - React onClick scan...", flush=True)
+            if not _scroll_expired():
+                print(f"  Scroll-to-find: phase 6 - React onClick scan...", flush=True)
             await self.browser.page.evaluate("window.scrollTo(0, 0)")
             await asyncio.sleep(0.05)
             for scroll_pos in range(0, total_h + 1200, 1200):
-                if time.time() - phase4_start > 35:
+                if _scroll_expired():
                     break
                 await self.browser.page.mouse.wheel(0, 1200)
                 await asyncio.sleep(0.08)
@@ -2051,6 +2095,9 @@ class AgentChallengeSolver:
                     return True
 
             # Phase 7: Use Playwright locators (auto scroll-into-view, handles virtual lists)
+            if _scroll_expired():
+                await self.browser.page.evaluate("window.scrollTo(0, 0)")
+                return False
             await _fill_best_code()  # Ensure correct code in input
             print(f"  Scroll-to-find: phase 7 - Playwright locator clicks...", flush=True)
             try:
@@ -2060,7 +2107,7 @@ class AgentChallengeSolver:
                 print(f"  Phase 7: {count} buttons found via locator", flush=True)
                 phase7_clicked = 0
                 for i in range(count):
-                    if time.time() - phase4_start > 50:
+                    if _scroll_expired():
                         break
                     try:
                         btn = all_buttons.nth(i)
@@ -2085,7 +2132,10 @@ class AgentChallengeSolver:
                 print(f"  Phase 7 error: {e}", flush=True)
 
             # ===== LAST RESORT: Deep extraction + try other codes =====
-            last_deep = await self._deep_code_extraction(codes_to_try)
+            if not _scroll_expired():
+                last_deep = await self._deep_code_extraction(codes_to_try)
+            else:
+                last_deep = []
             if last_deep:
                 print(f"  LAST RESORT: deep extraction found {len(last_deep)} codes: {last_deep[:10]}", flush=True)
                 for code in last_deep[:10]:
@@ -2094,15 +2144,17 @@ class AgentChallengeSolver:
                         return True
 
             # Try alternate codes with a quick Phase 0 scroll
-            alt_codes = [c for c in sorted_codes[1:] if c != best_code][:3]
+            alt_codes = [c for c in sorted_codes[1:] if c != best_code][:2]
             for alt_code in alt_codes:
+                if _scroll_expired():
+                    break
                 print(f"  LAST RESORT: retrying with code '{alt_code}'...", flush=True)
                 await _fill_best_code(alt_code)
                 await self.browser.page.evaluate("window.scrollTo(0, 0)")
                 await asyncio.sleep(0.1)
                 prev_y = 0
                 retry_start = time.time()
-                while time.time() - retry_start < 10:
+                while time.time() - retry_start < 5:
                     await self.browser.page.mouse.wheel(0, 800)
                     await asyncio.sleep(0.12)
                     url = await self.browser.get_url()
